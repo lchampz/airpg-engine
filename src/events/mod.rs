@@ -10,9 +10,17 @@ pub struct Event {
     #[serde(rename = "type")]
     pub event_type: EventType,
     pub source: String,
+    /// Ausente em eventos publicados pelo Mundo Vivo (Elixir não tem o
+    /// conceito de "turno" — é uma noção só do engine). Default 0.
+    #[serde(default)]
     pub turn: u64,
+    #[serde(default = "agora")]
     pub timestamp: DateTime<Utc>,
     pub payload: serde_json::Value,
+}
+
+fn agora() -> DateTime<Utc> {
+    Utc::now()
 }
 
 impl Event {

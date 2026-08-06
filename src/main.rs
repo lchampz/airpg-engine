@@ -3,28 +3,37 @@ mod events;
 mod guardrail;
 mod llm;
 mod orchestrator;
+mod reacoes;
 mod skills;
 mod state;
 
 use axum::{extract::State, routing::{get, post}, Json, Router};
-use events::{AcaoJogadorPayload, Event, EventType};
+use events::{AcaoJogadorPayload, ColisaoJogadorAgentePayload, Event, EventType};
 use futures::StreamExt;
 use guardrail::GuardrailSaida;
 use llm::LlmClient;
 use orchestrator::Orchestrator;
 use sqlx::sqlite::SqlitePool;
-use std::sync::Arc;
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
 use tower_http::cors::{Any, CorsLayer};
 
 const NATS_SUBJECT: &str = "airpg.events";
+const PLAYER_ID: &str = "player_01";
 
 #[derive(Clone)]
 struct AppState {
-    #[allow(dead_code)]
     pool: SqlitePool,
     orchestrator: Arc<Orchestrator>,
+    llm: LlmClient,
     guardrail_saida: Arc<GuardrailSaida>,
     nats: Option<async_nats::Client>,
+    turno: Arc<AtomicU64>,
+}
+
+#[derive(serde::Serialize)]
+struct TurnResult {
+    turno: u64,
+    eventos: Vec<Event>,
 }
 
 #[tokio::main]
@@ -48,16 +57,18 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    if let Some(client) = &nats {
-        spawn_subscriber(client.clone());
-    }
-
     let state = AppState {
         pool,
         orchestrator: Arc::new(Orchestrator),
-        guardrail_saida: Arc::new(GuardrailSaida::new(llm.clone())),
-        nats,
+        llm: llm.clone(),
+        guardrail_saida: Arc::new(GuardrailSaida::new(llm)),
+        nats: nats.clone(),
+        turno: Arc::new(AtomicU64::new(0)),
     };
+
+    if let Some(client) = &nats {
+        spawn_subscriber(client.clone(), state.clone());
+    }
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
@@ -74,84 +85,151 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Assina o barramento compartilhado com o airpg-world (Elixir) — hoje só loga
-/// o que chega (ex: colisao_jogador_agente), a próxima iteração deve acionar
-/// o Pool de Agentes reativo a partir daqui (ver Mundo-Vivo / Stack-Escolhida).
-fn spawn_subscriber(client: async_nats::Client) {
-    tokio::spawn(async move {
-        match client.subscribe(NATS_SUBJECT).await {
-            Ok(mut sub) => {
-                while let Some(msg) = sub.next().await {
-                    let payload = String::from_utf8_lossy(&msg.payload);
-                    tracing::info!(%payload, "evento recebido do barramento (airpg.events)");
-                }
-            }
-            Err(err) => tracing::error!(%err, "falha ao assinar {NATS_SUBJECT}"),
-        }
-    });
-}
-
 async fn health() -> &'static str {
     "ok"
 }
 
-/// Endpoint de turno: valida a ação (Guardrail de Entrada), gera a reação do
-/// agente reativo via LLM, filtra pelo Guardrail de Saída, publica no NATS,
-/// e devolve o evento final. Roteamento completo do Pool de Agentes (múltiplos
-/// NPCs, cap de 4/turno) ainda não plugado aqui — este endpoint simula um
-/// único agente reativo fixo para permitir debugar o comportamento da IA.
+/// Endpoint de turno: valida a ação (Guardrail de Entrada), roteia até
+/// MAX_AGENTES_POR_TURNO NPCs presentes na mesma location do jogador (ver
+/// Orquestrador-Central / Decisoes-Resolvidas), gera a reação de cada um em
+/// paralelo, filtra pelo Guardrail de Saída, publica no NATS e devolve o
+/// lote de eventos do turno.
 async fn processar_turno(
     State(app): State<AppState>,
     Json(acao): Json<AcaoJogadorPayload>,
-) -> Json<Event> {
-    let player = state::Player {
-        id: "player_01".into(),
-        hp: state::Hp { atual: 10, maximo: 10 },
-        atributos: Default::default(),
-        inventario: vec![],
-        location_id: "taverna_porto_velho".into(),
-        nivel: 1,
-        classe: "guerreiro".into(),
-    };
+) -> Json<TurnResult> {
+    let turno = app.turno.fetch_add(1, Ordering::SeqCst);
 
-    let evento = match app.orchestrator.validar_acao(&player, &acao) {
-        Err(rejeicao) => Event::new(
-            EventType::AcaoRejeitada,
-            "guardrail_entrada",
-            0,
-            serde_json::to_value(&rejeicao).unwrap(),
-        ),
-        Ok(()) => {
-            let bruto = gerar_dialogo_agente(&acao).await;
-            let aprovado = app.guardrail_saida.revisar(&bruto).await;
-
-            Event::new(
-                EventType::Dialogo,
-                "npc_taverneiro",
-                0,
-                serde_json::json!({ "texto": aprovado }),
-            )
+    let player = match db::get_player(&app.pool, PLAYER_ID).await {
+        Ok(Some(p)) => p,
+        _ => {
+            tracing::error!("player nao encontrado no estado rigido, usando fallback");
+            state::Player {
+                id: PLAYER_ID.into(),
+                hp: state::Hp { atual: 10, maximo: 10 },
+                atributos: Default::default(),
+                inventario: vec![],
+                location_id: "taverna_porto_velho".into(),
+                nivel: 1,
+                classe: "guerreiro".into(),
+            }
         }
     };
 
-    if let Some(client) = &app.nats {
-        let body = serde_json::to_vec(&evento).unwrap_or_default();
+    let eventos = match app.orchestrator.validar_acao(&player, &acao) {
+        Err(rejeicao) => vec![Event::new(
+            EventType::AcaoRejeitada,
+            "guardrail_entrada",
+            turno,
+            serde_json::to_value(&rejeicao).unwrap(),
+        )],
+        Ok(()) => {
+            let npcs = db::list_npcs(&app.pool).await.unwrap_or_default();
+            let roteados = app.orchestrator.rotear_agentes(&player, &npcs);
+
+            tracing::info!(
+                turno,
+                agentes = ?roteados.iter().map(|n| &n.id).collect::<Vec<_>>(),
+                "agentes roteados para o turno"
+            );
+
+            let reacoes = futures::future::join_all(roteados.iter().map(|npc| {
+                let llm = app.llm.clone();
+                let guardrail = app.guardrail_saida.clone();
+                let npc = (*npc).clone();
+                let texto_jogador = acao.response.clone();
+                async move {
+                    let texto = reacoes::dialogar(&llm, &guardrail, &npc, &texto_jogador).await;
+                    Event::new(EventType::Dialogo, npc.id.clone(), turno, serde_json::json!({ "texto": texto }))
+                }
+            }))
+            .await;
+
+            let mut eventos = reacoes;
+            eventos.push(app.orchestrator.evento_fim_de_turno(turno, &roteados));
+            eventos
+        }
+    };
+
+    publicar_lote(&app, &eventos).await;
+
+    Json(TurnResult { turno, eventos })
+}
+
+async fn publicar_lote(app: &AppState, eventos: &[Event]) {
+    let Some(client) = &app.nats else { return };
+    for evento in eventos {
+        let body = serde_json::to_vec(evento).unwrap_or_default();
         if let Err(err) = client.publish(NATS_SUBJECT, body.into()).await {
             tracing::warn!(%err, "falha ao publicar evento no NATS");
         }
     }
-
-    Json(evento)
 }
 
-async fn gerar_dialogo_agente(acao: &AcaoJogadorPayload) -> String {
-    let llm = LlmClient::from_env();
-    let system = "Você é Bram, um taverneiro amigável e desconfiado de forasteiros, num RPG de fantasia medieval. Responda em 1-2 frases curtas, em português, em personagem, nunca saindo do papel.";
-    match llm.complete(system, &acao.response).await {
-        Ok(texto) => texto,
-        Err(err) => {
-            tracing::error!(%err, "falha ao chamar o LLM para dialogo do agente");
-            "Bram franze a testa, sem saber o que responder.".to_string()
+/// Assina o barramento compartilhado com o airpg-world (Elixir). Ao receber
+/// `colisao_jogador_agente`, ativa o Pool de Agentes reativo para aquele NPC
+/// especificamente — exatamente como o roteamento normal, o pool não sabe
+/// (nem precisa saber) que veio de uma colisão autônoma (ver Pool-de-Agentes
+/// / Mundo-Vivo). Ao final, publica `interacao_finalizada` para o Elixir
+/// retomar a autonomia do NPC.
+fn spawn_subscriber(client: async_nats::Client, app: AppState) {
+    tokio::spawn(async move {
+        let mut sub = match client.subscribe(NATS_SUBJECT).await {
+            Ok(sub) => sub,
+            Err(err) => {
+                tracing::error!(%err, "falha ao assinar {NATS_SUBJECT}");
+                return;
+            }
+        };
+
+        while let Some(msg) = sub.next().await {
+            let evento = match serde_json::from_slice::<Event>(&msg.payload) {
+                Ok(evento) => evento,
+                Err(err) => {
+                    let corpo = String::from_utf8_lossy(&msg.payload);
+                    tracing::warn!(%err, corpo = %corpo, "evento do barramento nao pode ser deserializado, ignorando");
+                    continue;
+                }
+            };
+            if evento.event_type != EventType::ColisaoJogadorAgente {
+                continue;
+            }
+
+            let Ok(payload) = serde_json::from_value::<ColisaoJogadorAgentePayload>(evento.payload.clone()) else {
+                tracing::warn!("colisao_jogador_agente com payload invalido");
+                continue;
+            };
+
+            tracing::info!(agent_id = %payload.agent_id, "colisao recebida do mundo vivo, ativando pool de agentes");
+            tokio::spawn(reagir_a_colisao(client.clone(), app.clone(), payload));
         }
+    });
+}
+
+async fn reagir_a_colisao(client: async_nats::Client, app: AppState, colisao: ColisaoJogadorAgentePayload) {
+    let npc = match db::get_npc(&app.pool, &colisao.agent_id).await {
+        Ok(Some(npc)) => npc,
+        _ => {
+            tracing::warn!(agent_id = %colisao.agent_id, "npc da colisao nao encontrado no estado rigido");
+            return;
+        }
+    };
+
+    let turno = app.turno.fetch_add(1, Ordering::SeqCst);
+    let abertura = "O NPC encontra o jogador por acaso.";
+    let texto = reacoes::dialogar(&app.llm, &app.guardrail_saida, &npc, abertura).await;
+
+    let evento_dialogo = Event::new(EventType::Dialogo, npc.id.clone(), turno, serde_json::json!({ "texto": texto }));
+    publicar_lote(&app, &[evento_dialogo]).await;
+
+    let evento_finalizado = Event::new(
+        EventType::InteracaoFinalizada,
+        "orquestrador",
+        turno,
+        serde_json::json!({ "agent_id": npc.id, "resultado": "interacao_reativa_concluida" }),
+    );
+    let body = serde_json::to_vec(&evento_finalizado).unwrap_or_default();
+    if let Err(err) = client.publish(NATS_SUBJECT, body.into()).await {
+        tracing::warn!(%err, "falha ao publicar interacao_finalizada");
     }
 }
