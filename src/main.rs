@@ -7,6 +7,7 @@ mod jsonutil;
 mod llm;
 mod mestre;
 mod orchestrator;
+mod personagens;
 mod reacoes;
 mod skills;
 mod state;
@@ -128,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/llm-perfis", get(listar_llm_perfis))
         .route("/admin/llm-perfis/:perfil", axum::routing::put(atualizar_llm_perfil))
         .route("/log-global", get(obter_log_global))
+        .route("/admin/gerar-personagem", post(gerar_personagem_admin))
         .layer(cors)
         .with_state(state);
 
@@ -295,6 +297,29 @@ struct LogGlobalQuery {
 async fn obter_log_global(State(app): State<AppState>, Query(q): Query<LogGlobalQuery>) -> Json<Vec<db::AcaoGlobal>> {
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     Json(db::listar_acoes_globais(&app.pool, q.location_id.as_deref(), limit).await.unwrap_or_default())
+}
+
+#[derive(Deserialize)]
+struct GerarPersonagemPayload {
+    location_id: String,
+    #[serde(default)]
+    contexto: String,
+}
+
+/// Ver Módulo 1 em Tarefas-Pendentes no vault: gatilho manual (MVP) pra gerar
+/// um NPC novo sob demanda. Auto-gatilho a partir da criação de Cena fica
+/// pra depois.
+async fn gerar_personagem_admin(
+    State(app): State<AppState>,
+    Json(payload): Json<GerarPersonagemPayload>,
+) -> Result<Json<state::Npc>, axum::http::StatusCode> {
+    let llm = app.llm_perfil("personagens").await;
+    let turno_global = app.turno.load(Ordering::SeqCst) as i64;
+
+    match personagens::gerar_e_registrar_personagem(&app.pool, &llm, turno_global, &payload.location_id, &payload.contexto).await {
+        Some(npc) => Ok(Json(npc)),
+        None => Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY),
+    }
 }
 
 #[derive(Deserialize)]
