@@ -25,13 +25,22 @@ use llm::LlmClient;
 use orchestrator::Orchestrator;
 use serde::Deserialize;
 use sqlx::sqlite::SqlitePool;
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+use std::collections::HashMap;
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
+use std::time::{Duration, Instant};
 use tower_http::cors::{Any, CorsLayer};
 
 const NATS_SUBJECT: &str = "airpg.events";
 /// Usado quando o chamador não envia `x-player-id` (ex: curl manual, clientes
 /// antigos) — ver Change-Sessoes-Multiusuario.
 const PLAYER_ID_PADRAO: &str = "player_01";
+
+/// Cada turno dispara de 2 a 6 chamadas de LLM (NPCs, guardrail, mestre de
+/// jogo), então um player sozinho pode gerar custo de LLM sem controle sem
+/// algum limite. Simples e em memória — não há necessidade de Redis para
+/// uma engine de instância única (ver Change-Producao-LLM-Deploy).
+const MAX_TURNOS_POR_MINUTO: usize = 10;
+const JANELA_RATE_LIMIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct AppState {
@@ -41,6 +50,7 @@ struct AppState {
     guardrail_saida: Arc<GuardrailSaida>,
     nats: Option<async_nats::Client>,
     turno: Arc<AtomicU64>,
+    rate_limit: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -77,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         guardrail_saida: Arc::new(GuardrailSaida::new(llm)),
         nats: nats.clone(),
         turno: Arc::new(AtomicU64::new(0)),
+        rate_limit: Arc::new(Mutex::new(HashMap::new())),
     };
 
     if let Some(client) = &nats {
@@ -123,6 +134,23 @@ fn player_id_de(headers: &HeaderMap) -> String {
 #[derive(Deserialize)]
 struct PlayerIdQuery {
     player_id: Option<String>,
+}
+
+/// Registra o turno atual de `player_id` e diz se ele está dentro do limite
+/// de `MAX_TURNOS_POR_MINUTO`. Descarta timestamps mais antigos que
+/// `JANELA_RATE_LIMIT` a cada chamada para o mapa não crescer sem limite.
+fn dentro_do_limite_de_turnos(app: &AppState, player_id: &str) -> bool {
+    let agora = Instant::now();
+    let mut mapa = app.rate_limit.lock().unwrap();
+    let timestamps = mapa.entry(player_id.to_string()).or_insert_with(Vec::new);
+    timestamps.retain(|t| agora.duration_since(*t) < JANELA_RATE_LIMIT);
+
+    if timestamps.len() >= MAX_TURNOS_POR_MINUTO {
+        false
+    } else {
+        timestamps.push(agora);
+        true
+    }
 }
 
 async fn obter_player(State(app): State<AppState>, headers: HeaderMap, Query(q): Query<PlayerIdQuery>) -> Json<state::Player> {
@@ -206,6 +234,18 @@ async fn processar_turno(
 ) -> Json<TurnResult> {
     let turno = app.turno.fetch_add(1, Ordering::SeqCst);
     let player_id = player_id_de(&headers);
+
+    if !dentro_do_limite_de_turnos(&app, &player_id) {
+        return Json(TurnResult {
+            turno,
+            eventos: vec![Event::new(
+                EventType::AcaoRejeitada,
+                "rate_limit",
+                turno,
+                serde_json::json!({ "motivo": "rate_limit", "detalhe": "muitos turnos em pouco tempo, aguarde um momento" }),
+            )],
+        });
+    }
 
     let mut player = match db::get_ou_criar_player(&app.pool, &player_id).await {
         Ok(p) => p,
