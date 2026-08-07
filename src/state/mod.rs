@@ -7,7 +7,7 @@ pub struct Player {
     pub id: String,
     pub hp: Hp,
     pub atributos: std::collections::HashMap<String, i32>,
-    pub inventario: Vec<String>,
+    pub inventario: Vec<ItemInventario>,
     pub location_id: String,
     pub nivel: u32,
     pub classe: String,
@@ -19,6 +19,24 @@ pub struct Player {
     /// personagem ainda sem nome definido (ver Change-Ficha-Personagem).
     #[serde(default)]
     pub nome_personagem: Option<String>,
+}
+
+/// Ver Change-Inventario — item agregado por nome (quantidade, não entradas
+/// duplicadas) com categoria livre pra UI. `#[serde(default)]` nos campos
+/// novos porque registros antigos no SQLite tinham `inventario: Vec<String>`
+/// puro (tratado como lista vazia na migração, ver
+/// Change-Inventario/Tasks).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ItemInventario {
+    pub nome: String,
+    #[serde(default = "quantidade_padrao")]
+    pub quantidade: u32,
+    #[serde(default)]
+    pub categoria: String,
+}
+
+fn quantidade_padrao() -> u32 {
+    1
 }
 
 /// Limiares de XP por nível (índice = nível - 1). Constante no código, não no

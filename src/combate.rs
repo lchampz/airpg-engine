@@ -2,7 +2,7 @@ use crate::db;
 use crate::events::Event;
 use crate::events::EventType;
 use crate::skills::skill_rolar_dado;
-use crate::state::{nivel_por_xp, Combate, Npc, Player, PLAYER_CA_PADRAO};
+use crate::state::{nivel_por_xp, Combate, ItemInventario, Npc, Player, PLAYER_CA_PADRAO};
 use sqlx::sqlite::SqlitePool;
 
 /// Sistema de combate — jogador contra um único NPC hostil por vez (ver
@@ -182,15 +182,16 @@ fn aplicar_recompensa(player: &mut Player, npc: &Npc, turno: u64, eventos: &mut 
     }
 
     for item in &npc.loot {
-        if !player.inventario.contains(item) {
-            player.inventario.push(item.clone());
-            eventos.push(Event::new(
-                EventType::MudancaEstado,
-                "orquestrador",
-                turno,
-                serde_json::json!({ "campo": "player.inventario", "operacao": "adicionar", "valor": item }),
-            ));
+        match player.inventario.iter_mut().find(|i| &i.nome == item) {
+            Some(existente) => existente.quantidade += 1,
+            None => player.inventario.push(ItemInventario { nome: item.clone(), quantidade: 1, categoria: String::new() }),
         }
+        eventos.push(Event::new(
+            EventType::MudancaEstado,
+            "orquestrador",
+            turno,
+            serde_json::json!({ "campo": "player.inventario", "operacao": "adicionar", "valor": item }),
+        ));
     }
 }
 
@@ -263,7 +264,7 @@ mod tests {
                 encerrado = true;
                 if n.status == NpcStatus::Morto {
                     assert_eq!(p.xp, 50);
-                    assert!(p.inventario.contains(&"presa".to_string()));
+                    assert!(p.inventario.iter().any(|i| i.nome == "presa"));
                 }
                 break;
             }
