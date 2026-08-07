@@ -73,6 +73,17 @@ pub struct Npc {
     pub xp_recompensa: Option<u32>,
     #[serde(default)]
     pub loot: Vec<String>,
+    /// Campos de ficha de bestiário — descritivos, não mecânicos (ver
+    /// Change-Bestiario). Diferem de `hp`/`classe_armadura`/`dano_dado_faces`,
+    /// que alimentam o motor de combate.
+    #[serde(default)]
+    pub descricao: String,
+    #[serde(default)]
+    pub deslocamento: Option<String>,
+    #[serde(default)]
+    pub imunidades: Vec<String>,
+    #[serde(default)]
+    pub resistencias: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

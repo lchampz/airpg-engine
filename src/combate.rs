@@ -225,6 +225,10 @@ mod tests {
             dano_dado_faces: Some(4),
             xp_recompensa: Some(50),
             loot: vec!["presa".into()],
+            descricao: String::new(),
+            deslocamento: None,
+            imunidades: vec![],
+            resistencias: vec![],
         }
     }
 
