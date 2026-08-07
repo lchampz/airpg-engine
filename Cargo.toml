@@ -22,3 +22,13 @@ async-nats = "0.35"
 futures = "0.3"
 tower-http = { version = "0.6", features = ["cors"] }
 rand = "0.8"
+fastembed = "5"
+# ort-sys só está publicado no crates.io na rc.13 (confirmado — não existe
+# rc.4 de ort-sys, só de `ort`), então qualquer `ort` mais antigo que rc.13
+# ainda acaba puxando ort-sys=rc.13 no fim, cujo build script exige uma
+# feature de TLS explícita. Solução: usar fastembed 5.x (API compatível
+# com ort rc.13) e fixar `ort` na rc.13 com a feature de TLS habilitada
+# diretamente, em vez de tentar forçar uma versão antiga de ort (ver
+# Coordenacao-Entre-Sessoes.md pro histórico de tentativas que falharam).
+ort = { version = "=2.0.0-rc.13", features = ["download-binaries", "tls-rustls"] }
+clap = { version = "4", features = ["derive"] }

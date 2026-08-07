@@ -2,3 +2,6 @@
 *.db
 .env
 .claude/worktrees/
+# Cache de modelos ONNX do fastembed (ver rag/mod.rs) — baixado sob demanda,
+# não deve ser versionado (centenas de MB).
+.fastembed_cache/
