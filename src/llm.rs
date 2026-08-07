@@ -50,6 +50,20 @@ impl LlmClient {
         }
     }
 
+    /// Clona este cliente trocando model/api_base/api_key — usado para os
+    /// perfis de custo (ver Estrategia-Custo-Tokens no vault): "mundo"
+    /// (barato, geopolítica/tick autônomo) e "personagens" (pode ser mais
+    /// caro, geração sob demanda). `None` mantém o valor atual do cliente
+    /// base (ou seja, o padrão do ambiente).
+    pub fn with_config(&self, model: impl Into<String>, api_base: Option<String>, api_key: Option<String>) -> Self {
+        Self {
+            http: self.http.clone(),
+            base_url: api_base.unwrap_or_else(|| self.base_url.clone()),
+            api_key: api_key.unwrap_or_else(|| self.api_key.clone()),
+            model: model.into(),
+        }
+    }
+
     pub async fn complete(&self, system: &str, user: &str) -> anyhow::Result<String> {
         self.complete_with_history(system, &[], user).await
     }

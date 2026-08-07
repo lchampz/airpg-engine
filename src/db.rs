@@ -105,9 +105,187 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Perfis de modelo LLM (ver Estrategia-Custo-Tokens no vault): "mundo"
+    // (geopolítica/economia/tick autônomo, deve ser o mais barato possível)
+    // e "personagens" (geração de personagem sob demanda, pode usar um
+    // modelo mais caro/capaz). `api_base`/`api_key` nulos significam "usa o
+    // padrão do LITELLM_URL/LITELLM_API_KEY do ambiente" — só é preenchido
+    // quando o usuário pluga uma API key própria pela tela de configurações.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS configuracoes_llm (
+            perfil TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            api_base TEXT,
+            api_key TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // Log Global: livro-caixa de TODA ação relevante do mundo (jogador ou
+    // NPC autônomo), distinto de `eventos_historico` (que é só o chat de um
+    // jogador). Ver Módulo 4 em Tarefas-Pendentes no vault.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS acoes_globais (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            turno_global INTEGER NOT NULL,
+            ator_id TEXT NOT NULL,
+            ator_tipo TEXT NOT NULL,
+            tipo_acao TEXT NOT NULL,
+            descricao TEXT NOT NULL,
+            location_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    seed_configuracoes_llm_se_vazio(&pool).await?;
     seed_se_vazio(&pool).await?;
 
     Ok(pool)
+}
+
+const PERFIS_LLM_VALIDOS: &[&str] = &["mundo", "personagens"];
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfiguracaoLlm {
+    pub perfil: String,
+    pub model: String,
+    pub api_base: Option<String>,
+    /// Nunca serializado de volta pro cliente com o valor real — ver
+    /// `main.rs::obter_llm_perfis`, que redige isso antes de responder.
+    #[serde(skip_serializing)]
+    pub api_key: Option<String>,
+}
+
+async fn seed_configuracoes_llm_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
+    for perfil in PERFIS_LLM_VALIDOS {
+        if get_configuracao_llm(pool, perfil).await?.is_none() {
+            set_configuracao_llm(
+                pool,
+                &ConfiguracaoLlm { perfil: perfil.to_string(), model: "airpg-local".to_string(), api_base: None, api_key: None },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn get_configuracao_llm(pool: &SqlitePool, perfil: &str) -> anyhow::Result<Option<ConfiguracaoLlm>> {
+    let row: Option<(String, String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT perfil, model, api_base, api_key FROM configuracoes_llm WHERE perfil = ?")
+            .bind(perfil)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(perfil, model, api_base, api_key)| ConfiguracaoLlm { perfil, model, api_base, api_key }))
+}
+
+pub async fn list_configuracoes_llm(pool: &SqlitePool) -> anyhow::Result<Vec<ConfiguracaoLlm>> {
+    let rows: Vec<(String, String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT perfil, model, api_base, api_key FROM configuracoes_llm").fetch_all(pool).await?;
+    Ok(rows.into_iter().map(|(perfil, model, api_base, api_key)| ConfiguracaoLlm { perfil, model, api_base, api_key }).collect())
+}
+
+/// `perfil` já deve ter sido validado contra `PERFIS_LLM_VALIDOS` por quem
+/// chama (ver `main.rs::atualizar_llm_perfil`) — esta função não valida de
+/// novo, só persiste.
+pub async fn set_configuracao_llm(pool: &SqlitePool, cfg: &ConfiguracaoLlm) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO configuracoes_llm (perfil, model, api_base, api_key) VALUES (?, ?, ?, ?)
+         ON CONFLICT(perfil) DO UPDATE SET model = excluded.model, api_base = excluded.api_base, api_key = excluded.api_key",
+    )
+    .bind(&cfg.perfil)
+    .bind(&cfg.model)
+    .bind(&cfg.api_base)
+    .bind(&cfg.api_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub fn perfil_llm_valido(perfil: &str) -> bool {
+    PERFIS_LLM_VALIDOS.contains(&perfil)
+}
+
+/// Registra uma ação no Log Global — todo evento relevante do mundo, de
+/// jogador ou de NPC autônomo (ver Módulo 4 em Tarefas-Pendentes no vault).
+pub async fn registrar_acao_global(
+    pool: &SqlitePool,
+    turno_global: i64,
+    ator_id: &str,
+    ator_tipo: &str,
+    tipo_acao: &str,
+    descricao: &str,
+    location_id: &str,
+    timestamp: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO acoes_globais (turno_global, ator_id, ator_tipo, tipo_acao, descricao, location_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(turno_global)
+    .bind(ator_id)
+    .bind(ator_tipo)
+    .bind(tipo_acao)
+    .bind(descricao)
+    .bind(location_id)
+    .bind(timestamp)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AcaoGlobal {
+    pub id: i64,
+    pub turno_global: i64,
+    pub ator_id: String,
+    pub ator_tipo: String,
+    pub tipo_acao: String,
+    pub descricao: String,
+    pub location_id: String,
+    pub timestamp: String,
+}
+
+pub async fn listar_acoes_globais(pool: &SqlitePool, location_id: Option<&str>, limit: i64) -> anyhow::Result<Vec<AcaoGlobal>> {
+    let rows: Vec<(i64, i64, String, String, String, String, String, String)> = match location_id {
+        Some(loc) => {
+            sqlx::query_as(
+                "SELECT id, turno_global, ator_id, ator_tipo, tipo_acao, descricao, location_id, timestamp
+                 FROM acoes_globais WHERE location_id = ? ORDER BY id DESC LIMIT ?",
+            )
+            .bind(loc)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT id, turno_global, ator_id, ator_tipo, tipo_acao, descricao, location_id, timestamp
+                 FROM acoes_globais ORDER BY id DESC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|(id, turno_global, ator_id, ator_tipo, tipo_acao, descricao, location_id, timestamp)| AcaoGlobal {
+            id,
+            turno_global,
+            ator_id,
+            ator_tipo,
+            tipo_acao,
+            descricao,
+            location_id,
+            timestamp,
+        })
+        .collect())
 }
 
 /// `npc_memoria` mudou de esquema (chave composta npc_id+player_id, campos
@@ -147,69 +325,95 @@ async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
         if get_npc(pool, "npc_lobo_floresta").await?.is_none() {
             upsert_npc(pool, &npc_lobo_seed()).await?;
         }
+        backfill_descricao_npcs_historia(pool).await?;
         return Ok(());
     }
 
     upsert_player(pool, &Player::seed("player_01")).await?;
 
-    let npcs = vec![
-        Npc {
-            id: "npc_taverneiro_bram".into(),
-            nome: "Bram".into(),
-            status: crate::state::NpcStatus::Vivo,
-            atitude_com_jogador: "neutro".into(),
-            location_id: "taverna_porto_velho".into(),
-            autonomo: true,
-            hp: None,
-            classe_armadura: None,
-            dano_dado_faces: None,
-            xp_recompensa: None,
-            loot: vec![],
-            descricao: String::new(),
-            deslocamento: None,
-            imunidades: vec![],
-            resistencias: vec![],
-        },
-        Npc {
-            id: "npc_cliente_gerta".into(),
-            nome: "Gerta".into(),
-            status: crate::state::NpcStatus::Vivo,
-            atitude_com_jogador: "neutro".into(),
-            location_id: "taverna_porto_velho".into(),
-            autonomo: false,
-            hp: None,
-            classe_armadura: None,
-            dano_dado_faces: None,
-            xp_recompensa: None,
-            loot: vec![],
-            descricao: String::new(),
-            deslocamento: None,
-            imunidades: vec![],
-            resistencias: vec![],
-        },
-        Npc {
-            id: "npc_guarda_holt".into(),
-            nome: "Holt".into(),
-            status: crate::state::NpcStatus::Vivo,
-            atitude_com_jogador: "desconfiado".into(),
-            location_id: "floresta_negra".into(),
-            autonomo: true,
-            hp: None,
-            classe_armadura: None,
-            dano_dado_faces: None,
-            xp_recompensa: None,
-            loot: vec![],
-            descricao: String::new(),
-            deslocamento: None,
-            imunidades: vec![],
-            resistencias: vec![],
-        },
-        npc_lobo_seed(),
-    ];
+    let npcs = vec![npc_taverneiro_bram_seed(), npc_cliente_gerta_seed(), npc_guarda_holt_seed(), npc_lobo_seed()];
     for npc in &npcs {
         upsert_npc(pool, npc).await?;
     }
 
+    Ok(())
+}
+
+fn npc_taverneiro_bram_seed() -> Npc {
+    Npc {
+        id: "npc_taverneiro_bram".into(),
+        nome: "Bram".into(),
+        status: crate::state::NpcStatus::Vivo,
+        atitude_com_jogador: "neutro".into(),
+        location_id: "taverna_porto_velho".into(),
+        autonomo: true,
+        hp: None,
+        classe_armadura: None,
+        dano_dado_faces: None,
+        xp_recompensa: None,
+        loot: vec![],
+        descricao: "Taverneiro do Porto Velho, dono do lugar. Homem corpulento, direto e prático — fala pouco, vai reto ao assunto (preço, pedido, regra da casa) e não se mete em conversa que não seja com ele. É a autoridade sobre qualquer coisa da taverna: bebida, comida, quarto, cliente baderneiro.".into(),
+        deslocamento: None,
+        imunidades: vec![],
+        resistencias: vec![],
+    }
+}
+
+fn npc_cliente_gerta_seed() -> Npc {
+    Npc {
+        id: "npc_cliente_gerta".into(),
+        nome: "Gerta".into(),
+        status: crate::state::NpcStatus::Vivo,
+        atitude_com_jogador: "neutro".into(),
+        location_id: "taverna_porto_velho".into(),
+        autonomo: false,
+        hp: None,
+        classe_armadura: None,
+        dano_dado_faces: None,
+        xp_recompensa: None,
+        loot: vec![],
+        descricao: "Cliente frequente da taverna, não trabalha ali e não tem autoridade sobre preço, bebida ou regra da casa — isso é assunto do Bram. Fofoqueira e curiosa, adora comentar sobre outros hóspedes e os rumores do Porto Velho, mas só se intromete em conversa que já é sobre ela ou dirigida a ela; não responde por Bram nem sobre assuntos da taverna que só ele decide.".into(),
+        deslocamento: None,
+        imunidades: vec![],
+        resistencias: vec![],
+    }
+}
+
+fn npc_guarda_holt_seed() -> Npc {
+    Npc {
+        id: "npc_guarda_holt".into(),
+        nome: "Holt".into(),
+        status: crate::state::NpcStatus::Vivo,
+        atitude_com_jogador: "desconfiado".into(),
+        location_id: "floresta_negra".into(),
+        autonomo: true,
+        hp: None,
+        classe_armadura: None,
+        dano_dado_faces: None,
+        xp_recompensa: None,
+        loot: vec![],
+        descricao: "Guarda que patrulha a entrada da Floresta Negra. Curto de paciência com estranhos, fala em frases secas e vai direto à pergunta que importa para ele: o que você quer aqui e se é perigoso. Só se interessa por assuntos de segurança da floresta, não tem opinião sobre nada da taverna ou do resto da cidade.".into(),
+        deslocamento: None,
+        imunidades: vec![],
+        resistencias: vec![],
+    }
+}
+
+/// Patch pontual: `npc_taverneiro_bram`, `npc_cliente_gerta` e
+/// `npc_guarda_holt` ganharam `descricao` (papel + personalidade, ver
+/// `reacoes::montar_system_prompt` e `mestre::avaliar_destinatarios`) depois
+/// que muitos volumes de dev/produção já tinham sido semeados sem ela. Só
+/// preenche se ainda estiver vazia — não sobrescreve descrição já
+/// personalizada por alguma sessão de jogo.
+async fn backfill_descricao_npcs_historia(pool: &SqlitePool) -> anyhow::Result<()> {
+    for seed in [npc_taverneiro_bram_seed(), npc_cliente_gerta_seed(), npc_guarda_holt_seed()] {
+        if let Some(mut npc) = get_npc(pool, &seed.id).await? {
+            if npc.descricao.is_empty() {
+                npc.descricao = seed.descricao;
+                upsert_npc(pool, &npc).await?;
+            }
+        }
+    }
     Ok(())
 }
 

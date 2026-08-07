@@ -145,6 +145,65 @@ pub async fn avaliar_inicio_combate(llm: &LlmClient, acao: &str, combatentes: &[
         .and_then(|p| combatentes.iter().find(|n| n.id == p.alvo_id).map(|n| n.id.clone()))
 }
 
+const SYSTEM_PROMPT_DESTINATARIOS: &str = r#"Você é o Mestre de Jogo de um RPG de fantasia medieval. Vários personagens estão na mesma cena que o jogador. Decida quais deles devem reagir à ação do jogador neste turno.
+Responda APENAS com um JSON no formato {"destinatarios": ["id1", "id2"]}.
+Regras:
+- Se o jogador dirige a ação/fala a um personagem específico (por nome, ou porque só faz sentido para o papel dele — ex: perguntar o preço da bebida é assunto do taverneiro, não de outro cliente), inclua APENAS o id desse personagem.
+- Se o jogador fala de forma geral para o ambiente/grupo (ex: "-Olá a todos", observar a sala em voz alta), inclua todos os presentes.
+- Um personagem que não foi endereçado só entra na lista se tiver um motivo forte para interromper por conta própria (reagir a uma ameaça, a algo chocante que ele testemunha). Sem esse motivo, prefira uma lista mais curta — silêncio de quem não foi chamado é o comportamento correto, não um erro.
+- Use APENAS ids que estejam na lista de presentes."#;
+
+#[derive(Debug, Deserialize)]
+struct DestinatariosProposta {
+    #[serde(default)]
+    destinatarios: Vec<String>,
+}
+
+/// Decide, dentre os NPCs roteados para o turno (já filtrados por localização
+/// pelo Orchestrator), quais de fato devem responder à ação do jogador — sem
+/// isso, todo NPC presente respondia à mesma frase independentemente, mesmo
+/// quando o jogador claramente falava só com um deles (ex: perguntar o preço
+/// da cerveja fazia o taverneiro E o cliente ao lado responderem, com preços
+/// contraditórios). Ambíguo ou erro de LLM cai para "todos respondem" (o
+/// comportamento anterior a esta mudança), nunca para "ninguém responde" —
+/// não é este o defeito que estamos corrigindo.
+pub async fn avaliar_destinatarios(llm: &LlmClient, acao: &str, presentes: &[&Npc]) -> Vec<String> {
+    let todos: Vec<String> = presentes.iter().map(|n| n.id.clone()).collect();
+    if presentes.len() <= 1 {
+        return todos;
+    }
+
+    let lista = presentes
+        .iter()
+        .map(|n| {
+            let papel = if n.descricao.is_empty() { "sem papel definido".to_string() } else { n.descricao.clone() };
+            format!("{} (id: {}, papel: {})", n.nome, n.id, papel)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let entrada = format!("Personagens presentes: {lista}\nAção do jogador: {acao}");
+
+    let proposta = match llm.complete(SYSTEM_PROMPT_DESTINATARIOS, &entrada).await {
+        Ok(resposta) => extrair_json::<DestinatariosProposta>(&resposta),
+        Err(err) => {
+            tracing::error!(%err, "falha ao consultar o Mestre de Jogo para decidir destinatarios");
+            None
+        }
+    };
+
+    match proposta {
+        Some(p) => {
+            let filtrados: Vec<String> = p.destinatarios.into_iter().filter(|id| todos.contains(id)).collect();
+            if filtrados.is_empty() {
+                todos
+            } else {
+                filtrados
+            }
+        }
+        None => todos,
+    }
+}
+
 const SYSTEM_PROMPT_ACAO_COMBATE: &str = r#"Você é o Mestre de Jogo de um RPG de fantasia medieval. O jogador está em combate. Classifique a ação dele.
 Responda APENAS com um JSON no formato {"tipo": "atacar" | "fugir" | "outro"}."#;
 

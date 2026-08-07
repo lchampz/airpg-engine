@@ -79,8 +79,14 @@ async fn dialogar(
 
 fn montar_system_prompt(npc: &Npc, cena: &Cena, memoria: &MemoriaNpc, resultado_dados: Option<&ResultadoDados>) -> String {
     let mut partes = vec![format!(
-        "Você é {}, um NPC num RPG de fantasia medieval. Sua atitude de base com o jogador é: {}.",
-        npc.nome, npc.atitude_com_jogador
+        "Você é {}, um NPC num RPG de fantasia medieval. Sua atitude de base com o jogador é: {}.{}",
+        npc.nome,
+        npc.atitude_com_jogador,
+        if npc.descricao.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", npc.descricao)
+        }
     )];
 
     partes.push(format!(

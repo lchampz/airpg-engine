@@ -53,6 +53,20 @@ struct AppState {
     rate_limit: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
 }
 
+impl AppState {
+    /// Resolve o `LlmClient` para um perfil de custo ("mundo" ou
+    /// "personagens", ver Estrategia-Custo-Tokens no vault) a partir da
+    /// configuração persistida — editável em runtime pela tela de
+    /// configurações, sem redeploy. Cai para `self.llm` (padrão do
+    /// ambiente) se não houver configuração ou perfil for desconhecido.
+    async fn llm_perfil(&self, perfil: &str) -> LlmClient {
+        match db::get_configuracao_llm(&self.pool, perfil).await {
+            Ok(Some(cfg)) => self.llm.with_config(cfg.model, cfg.api_base, cfg.api_key),
+            _ => self.llm.clone(),
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct TurnResult {
     turno: u64,
@@ -111,6 +125,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/combate", get(obter_combate))
         .route("/historico", get(obter_historico))
         .route("/cenas/:location_id/fatos", post(adicionar_fato_a_cena))
+        .route("/admin/llm-perfis", get(listar_llm_perfis))
+        .route("/admin/llm-perfis/:perfil", axum::routing::put(atualizar_llm_perfil))
+        .route("/log-global", get(obter_log_global))
         .layer(cors)
         .with_state(state);
 
@@ -195,6 +212,89 @@ async fn obter_combate(State(app): State<AppState>, headers: HeaderMap) -> Json<
 async fn obter_historico(State(app): State<AppState>, headers: HeaderMap) -> Json<Vec<Event>> {
     let player_id = player_id_de(&headers);
     Json(db::historico_do_jogador(&app.pool, &player_id, 100).await.unwrap_or_default())
+}
+
+/// Ver Estrategia-Custo-Tokens no vault: perfis de modelo por sensibilidade
+/// a custo, editáveis em runtime sem redeploy. `api_key` nunca é devolvida
+/// (ver `#[serde(skip_serializing)]` em `db::ConfiguracaoLlm`) — só o resto
+/// da config, e um booleano indicando se uma key própria está configurada.
+#[derive(serde::Serialize)]
+struct LlmPerfilResposta {
+    perfil: String,
+    model: String,
+    api_base: Option<String>,
+    api_key_configurada: bool,
+}
+
+async fn listar_llm_perfis(State(app): State<AppState>) -> Json<Vec<LlmPerfilResposta>> {
+    let cfgs = db::list_configuracoes_llm(&app.pool).await.unwrap_or_default();
+    Json(
+        cfgs.into_iter()
+            .map(|c| LlmPerfilResposta {
+                perfil: c.perfil,
+                model: c.model,
+                api_base: c.api_base,
+                api_key_configurada: c.api_key.is_some(),
+            })
+            .collect(),
+    )
+}
+
+#[derive(Deserialize)]
+struct AtualizarLlmPerfilPayload {
+    model: String,
+    #[serde(default)]
+    api_base: Option<String>,
+    /// Omitido ou `null`: mantém a key atual. String vazia: remove a key
+    /// (volta a usar o padrão do ambiente).
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+async fn atualizar_llm_perfil(
+    State(app): State<AppState>,
+    Path(perfil): Path<String>,
+    Json(payload): Json<AtualizarLlmPerfilPayload>,
+) -> Result<Json<LlmPerfilResposta>, axum::http::StatusCode> {
+    if !db::perfil_llm_valido(&perfil) {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    }
+    if payload.model.trim().is_empty() {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    let atual = db::get_configuracao_llm(&app.pool, &perfil).await.ok().flatten();
+    let api_key = match payload.api_key {
+        Some(ref k) if k.is_empty() => None,
+        Some(k) => Some(k),
+        None => atual.and_then(|c| c.api_key),
+    };
+
+    let cfg = db::ConfiguracaoLlm { perfil: perfil.clone(), model: payload.model, api_base: payload.api_base, api_key };
+    if let Err(err) = db::set_configuracao_llm(&app.pool, &cfg).await {
+        tracing::error!(%err, %perfil, "falha ao salvar configuracao de llm");
+        return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok(Json(LlmPerfilResposta {
+        perfil: cfg.perfil,
+        model: cfg.model,
+        api_base: cfg.api_base,
+        api_key_configurada: cfg.api_key.is_some(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct LogGlobalQuery {
+    location_id: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Ver Módulo 4 em Tarefas-Pendentes no vault: livro-caixa de todo o mundo,
+/// não só do jogador que chama.
+async fn obter_log_global(State(app): State<AppState>, Query(q): Query<LogGlobalQuery>) -> Json<Vec<db::AcaoGlobal>> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    Json(db::listar_acoes_globais(&app.pool, q.location_id.as_deref(), limit).await.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -324,10 +424,20 @@ async fn processar_turno(
             let roteados = app.orchestrator.rotear_agentes(&player, &npcs);
             presentes = roteados.iter().map(|n| n.id.clone()).collect();
 
+            // Destinatários: dos NPCs presentes, só quem foi de fato
+            // endereçado (ou tem motivo forte para interromper) participa do
+            // diálogo deste turno — ver mestre::avaliar_destinatarios. Sem
+            // isso, todo NPC roteado respondia à mesma fala do jogador,
+            // mesmo quando só um deles fazia sentido (ex: preço de bebida
+            // respondido por dois NPCs com valores contraditórios).
+            let destinatarios_ids = mestre::avaliar_destinatarios(&app.llm, &acao.response, &roteados).await;
+            let destinatarios: Vec<&state::Npc> = roteados.iter().filter(|n| destinatarios_ids.contains(&n.id)).copied().collect();
+
             tracing::info!(
                 turno,
                 cena = %cena.nome,
                 agentes = ?roteados.iter().map(|n| &n.id).collect::<Vec<_>>(),
+                destinatarios = ?destinatarios.iter().map(|n| &n.id).collect::<Vec<_>>(),
                 "agentes roteados para o turno"
             );
 
@@ -342,7 +452,7 @@ async fn processar_turno(
                 });
             }
 
-            let respostas = futures::future::join_all(roteados.iter().map(|npc| {
+            let respostas = futures::future::join_all(destinatarios.iter().map(|npc| {
                 let pool = app.pool.clone();
                 let llm = app.llm.clone();
                 let guardrail = app.guardrail_saida.clone();
