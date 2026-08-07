@@ -70,7 +70,10 @@ pub async fn propor_e_validar(llm: &LlmClient, contexto: &str, npcs_presentes: &
         return propostas;
     }
 
-    let paga_moedas = propostas.iter().any(|p| p.campo == "player.moedas" && p.operacao == "somar" && p.valor.as_i64().is_some_and(|v| v < 0));
+    let moeda_proposta_valor = propostas
+        .iter()
+        .find(|p| p.campo == "player.moedas" && p.operacao == "somar")
+        .and_then(|p| p.valor.as_i64());
 
     let item_com_preco_sem_pagamento = propostas.iter().find_map(|p| {
         if p.campo != "player.inventario" || p.operacao != "adicionar" {
@@ -80,17 +83,30 @@ pub async fn propor_e_validar(llm: &LlmClient, contexto: &str, npcs_presentes: &
         precos_conhecidos.get(item).map(|&preco| (item.to_string(), preco))
     });
 
-    if let Some((item, preco)) = item_com_preco_sem_pagamento {
-        if !paga_moedas {
-            let vendedor = npcs_presentes.iter().find(|n| n.precos.contains_key(&item)).map(|n| n.nome.as_str()).unwrap_or("o vendedor");
-            let entrada_corrigida = format!(
-                "{contexto}\n\nATENÇÃO: você propôs que o jogador ganhasse \"{item}\", que custa {preco} moedas na loja de {vendedor}. \
-                 Isso só é válido se o texto acima deixa claro que foi de graça, recompensa, achado ou roubado. Reescreva a lista de mudanças: \
-                 se foi uma compra normal, inclua também {{\"campo\": \"player.moedas\", \"operacao\": \"somar\", \"valor\": -{preco}}}. \
-                 Se não houve pagamento nem justificativa clara no texto original, remova a proposta de ganhar \"{item}\"."
-            );
-            tracing::info!(%item, preco, %vendedor, "state_changes: item ganho sem contrapartida, pedindo correcao ao mestre de jogo");
-            return propor_mudancas(llm, &entrada_corrigida).await;
+    if let Some((item, preco)) = &item_com_preco_sem_pagamento {
+        let vendedor = npcs_presentes.iter().find(|n| n.precos.contains_key(item)).map(|n| n.nome.as_str()).unwrap_or("o vendedor");
+        match moeda_proposta_valor {
+            None => {
+                let entrada_corrigida = format!(
+                    "{contexto}\n\nATENÇÃO: você propôs que o jogador ganhasse \"{item}\", que custa {preco} moedas na loja de {vendedor}. \
+                     Isso só é válido se o texto acima deixa claro que foi de graça, recompensa, achado ou roubado. Reescreva a lista de mudanças: \
+                     se foi uma compra normal, inclua também {{\"campo\": \"player.moedas\", \"operacao\": \"somar\", \"valor\": -{preco}}}. \
+                     Se não houve pagamento nem justificativa clara no texto original, remova a proposta de ganhar \"{item}\"."
+                );
+                tracing::info!(%item, preco, %vendedor, "state_changes: item ganho sem contrapartida, pedindo correcao ao mestre de jogo");
+                return propor_mudancas(llm, &entrada_corrigida).await;
+            }
+            // Cobrou algo, mas não o preço certo — o preço é FIXO por NPC
+            // (decisão do usuário), então a narrativa não decide o valor.
+            Some(v) if v != -(*preco as i64) => {
+                let entrada_corrigida = format!(
+                    "{contexto}\n\nATENÇÃO: \"{item}\" tem preço FIXO de {preco} moedas na loja de {vendedor} — o preço não é negociável nem decidido pela narração. \
+                     Reescreva a lista de mudanças usando exatamente {{\"campo\": \"player.moedas\", \"operacao\": \"somar\", \"valor\": -{preco}}} para o pagamento."
+                );
+                tracing::info!(%item, preco, valor_proposto = v, %vendedor, "state_changes: valor pago nao bate com preco fixo, corrigindo");
+                return propor_mudancas(llm, &entrada_corrigida).await;
+            }
+            Some(_) => {}
         }
     }
 
@@ -98,12 +114,7 @@ pub async fn propor_e_validar(llm: &LlmClient, contexto: &str, npcs_presentes: &
     // preço de algum item conhecido, mas o item nunca foi proposto pro
     // inventário — pagamento "no vazio". Mesma filosofia: o Mestre de Jogo
     // reescreve, o código nunca insere o item sozinho.
-    let valor_pago = propostas
-        .iter()
-        .find(|p| p.campo == "player.moedas" && p.operacao == "somar")
-        .and_then(|p| p.valor.as_i64())
-        .filter(|v| *v < 0)
-        .map(|v| (-v) as u32);
+    let valor_pago = moeda_proposta_valor.filter(|v| *v < 0).map(|v| (-v) as u32);
 
     if let Some(preco_pago) = valor_pago {
         let item_correspondente = precos_conhecidos.iter().find(|(_, &preco)| preco == preco_pago).map(|(&item, _)| item);
