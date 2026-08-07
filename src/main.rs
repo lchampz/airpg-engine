@@ -542,7 +542,8 @@ async fn processar_turno(
                 respostas.iter().map(|(id, t)| format!("{id} disse: {t}")).collect::<Vec<_>>().join("\n")
             );
             let hp_antes_das_propostas = player.hp.atual;
-            let propostas = state_changes::propor_mudancas(&app.llm, &contexto).await;
+            let llm_arbitro = app.llm_perfil("arbitro").await;
+            let propostas = state_changes::propor_e_validar(&llm_arbitro, &contexto, &roteados).await;
             for proposta in &propostas {
                 match state_changes::aplicar(&mut player, turno, proposta) {
                     Ok(evento) => eventos.push(evento),

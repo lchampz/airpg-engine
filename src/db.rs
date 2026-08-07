@@ -168,7 +168,10 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     Ok(pool)
 }
 
-const PERFIS_LLM_VALIDOS: &[&str] = &["mundo", "personagens"];
+/// "arbitro" (ver Change-Economia-Viva-e-Consistencia) decide consistência de
+/// estado/economia — a chamada que mais se beneficia de um modelo melhor,
+/// já que decide "isso faz sentido no mundo?", não só "isso soa bem?".
+const PERFIS_LLM_VALIDOS: &[&str] = &["mundo", "personagens", "arbitro"];
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfiguracaoLlm {
@@ -374,6 +377,9 @@ fn npc_taverneiro_bram_seed() -> Npc {
         deslocamento: None,
         imunidades: vec![],
         resistencias: vec![],
+        moedas: Some(50),
+        precos: [("cerveja".to_string(), 5u32)].into_iter().collect(),
+        interesses: vec!["precisa manter a taverna lucrativa — cobra tudo que vende, nunca dá de graça sem um motivo claro".into()],
     }
 }
 
@@ -394,6 +400,9 @@ fn npc_cliente_gerta_seed() -> Npc {
         deslocamento: None,
         imunidades: vec![],
         resistencias: vec![],
+        moedas: None,
+        precos: std::collections::HashMap::new(),
+        interesses: vec!["adora fofoca sobre os outros hóspedes e os rumores do Porto Velho".into()],
     }
 }
 
@@ -414,20 +423,40 @@ fn npc_guarda_holt_seed() -> Npc {
         deslocamento: None,
         imunidades: vec![],
         resistencias: vec![],
+        moedas: None,
+        precos: std::collections::HashMap::new(),
+        interesses: vec!["quer manter a floresta livre de intrusos perigosos".into()],
     }
 }
 
 /// Patch pontual: `npc_taverneiro_bram`, `npc_cliente_gerta` e
 /// `npc_guarda_holt` ganharam `descricao` (papel + personalidade, ver
-/// `reacoes::montar_system_prompt` e `mestre::avaliar_destinatarios`) depois
-/// que muitos volumes de dev/produção já tinham sido semeados sem ela. Só
-/// preenche se ainda estiver vazia — não sobrescreve descrição já
-/// personalizada por alguma sessão de jogo.
+/// `reacoes::montar_system_prompt` e `mestre::avaliar_destinatarios`) e depois
+/// `moedas`/`precos`/`interesses` (ver Change-Economia-Viva-e-Consistencia)
+/// depois que muitos volumes de dev/produção já tinham sido semeados sem
+/// eles. Só preenche o que ainda estiver vazio/`None` — não sobrescreve
+/// personalização feita por alguma sessão de jogo.
 async fn backfill_descricao_npcs_historia(pool: &SqlitePool) -> anyhow::Result<()> {
     for seed in [npc_taverneiro_bram_seed(), npc_cliente_gerta_seed(), npc_guarda_holt_seed()] {
         if let Some(mut npc) = get_npc(pool, &seed.id).await? {
+            let mut mudou = false;
             if npc.descricao.is_empty() {
                 npc.descricao = seed.descricao;
+                mudou = true;
+            }
+            if npc.moedas.is_none() && seed.moedas.is_some() {
+                npc.moedas = seed.moedas;
+                mudou = true;
+            }
+            if npc.precos.is_empty() && !seed.precos.is_empty() {
+                npc.precos = seed.precos;
+                mudou = true;
+            }
+            if npc.interesses.is_empty() && !seed.interesses.is_empty() {
+                npc.interesses = seed.interesses;
+                mudou = true;
+            }
+            if mudou {
                 upsert_npc(pool, &npc).await?;
             }
         }
@@ -454,6 +483,9 @@ fn npc_lobo_seed() -> Npc {
         deslocamento: Some("9m".into()),
         imunidades: vec![],
         resistencias: vec!["frio".into()],
+        moedas: None,
+        precos: std::collections::HashMap::new(),
+        interesses: vec![],
     }
 }
 

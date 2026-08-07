@@ -11,8 +11,8 @@ use sqlx::sqlite::SqlitePool;
 /// Estrategia-Custo-Tokens) — pode ser um modelo mais caro/capaz, já que a
 /// chamada é rara.
 const SYSTEM_PROMPT_GERAR_PERSONAGEM: &str = r#"Você é um criador de personagens de um RPG de fantasia medieval. Dado um local e um contexto, invente um NPC novo, com personalidade distinta e papel claro na comunidade.
-Responda APENAS com um JSON no formato {"nome": "...", "descricao": "papel + personalidade em 2-3 frases", "atitude_com_jogador": "neutro|hostil|desconfiado|aliado|amigavel", "autonomo": bool}.
-A descrição deve deixar claro o que esse personagem FAZ (papel na comunidade) e o que ele NÃO tem autoridade para decidir (limites claros), pra outros personagens saberem quando não é da conta dele responder. Personalidade deve ser específica e memorável, nunca genérica."#;
+Responda APENAS com um JSON no formato {"nome": "...", "descricao": "papel + personalidade em 2-3 frases", "atitude_com_jogador": "neutro|hostil|desconfiado|aliado|amigavel", "autonomo": bool, "interesses": ["motivação ou necessidade concreta 1", "motivação ou necessidade concreta 2"]}.
+A descrição deve deixar claro o que esse personagem FAZ (papel na comunidade) e o que ele NÃO tem autoridade para decidir (limites claros), pra outros personagens saberem quando não é da conta dele responder. "interesses" são 1-3 motivações concretas e específicas (ex: "precisa juntar moedas pra pagar uma dívida", "quer notícias de um filho que viajou") — nunca genéricas como "é curioso". Personalidade deve ser específica e memorável, nunca genérica."#;
 
 const ATITUDES_VALIDAS: &[&str] = &["neutro", "hostil", "desconfiado", "aliado", "amigavel"];
 
@@ -26,6 +26,8 @@ struct PersonagemProposto {
     atitude_com_jogador: String,
     #[serde(default)]
     autonomo: bool,
+    #[serde(default)]
+    interesses: Vec<String>,
 }
 
 /// Gera um NPC novo via LLM — nunca confia cegamente no resultado (mesmo
@@ -70,6 +72,12 @@ pub async fn gerar_personagem(llm: &LlmClient, location_id: &str, contexto: &str
         deslocamento: None,
         imunidades: vec![],
         resistencias: vec![],
+        // Personagens gerados sob demanda nunca nascem com caixa/preços
+        // próprios — vender algo exige que alguém (Mestre de Jogo, sessão de
+        // jogo futura) decida isso deliberadamente, não a geração genérica.
+        moedas: None,
+        precos: std::collections::HashMap::new(),
+        interesses: proposta.interesses,
     })
 }
 

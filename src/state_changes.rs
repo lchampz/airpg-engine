@@ -1,8 +1,9 @@
 use crate::events::{Event, EventType};
 use crate::jsonutil::extrair_json;
 use crate::llm::LlmClient;
-use crate::state::{ItemInventario, Player};
+use crate::state::{ItemInventario, Npc, Player};
 use serde::Deserialize;
+use std::collections::HashMap;
 
 /// Persistência de mudança de estado: o LLM só **sugere**, nunca escreve
 /// direto (ver Estado-Rigido / Pool-de-Agentes — "único ponto de escrita").
@@ -33,7 +34,8 @@ Responda APENAS com um JSON no formato {"mudancas": [{"campo": "...", "operacao"
 Se nada mudou mecanicamente, responda {"mudancas": []} — a maioria dos turnos não muda nada, diálogo comum NUNCA é motivo de mudança.
 Campos permitidos e suas operações:
 - "player.hp" com operacao "somar" e valor um número inteiro (negativo para dano, positivo para cura)
-- "player.inventario" com operacao "adicionar" ou "remover" e valor uma string (nome do item). Ao "adicionar" um item, informe também "categoria": uma string curta e livre classificando o item (ex: "arma", "consumivel", "material", "missao") — se não souber classificar, use uma string vazia
+- "player.moedas" com operacao "somar" e valor um número inteiro (negativo para gastar/pagar, positivo para ganhar/receber)
+- "player.inventario" com operacao "adicionar" ou "remover" e valor uma string (nome do item). Ao "adicionar" um item, informe também "categoria": uma string curta e livre classificando o item (ex: "arma", "consumivel", "material", "missao") — se não souber classificar, use uma string vazia. Se o item foi COMPRADO de um vendedor, inclua TAMBÉM uma mudança separada em "player.moedas" com o valor pago (negativo) — ganhar um item sem essa contrapartida só é válido se o texto deixar claro que foi de graça, recompensa, achado ou roubado
 - "player.location_id" com operacao "definir" e valor uma string curta em snake_case identificando o novo local (ex: "floresta_negra"), só se o jogador CLARAMENTE se deslocou para outro lugar (andou até, viajou para, entrou em)
 Só proponha uma mudança se o texto deixar EXPLÍCITO que algo foi ganho, perdido, causou dano, curou, ou que o jogador se moveu de local. Nunca invente itens, dano ou destinos que não foram mencionados."#;
 
@@ -52,6 +54,48 @@ pub async fn propor_mudancas(llm: &LlmClient, contexto: &str) -> Vec<MudancaProp
     }
 }
 
+/// Ver Change-Economia-Viva-e-Consistencia: quando o LLM propõe ganhar um
+/// item cujo preço é conhecido (`Npc.precos` de algum NPC presente no
+/// turno), mas não propõe a dedução simétrica de `player.moedas`, o Mestre
+/// de Jogo é chamado de novo pra reescrever a própria lista de mudanças —
+/// nunca aplicamos a proposta original inconsistente, e nunca inventamos a
+/// correção no código (decisão do usuário: "o mestre de jogo reescreve a
+/// cena", não um desconto silencioso).
+pub async fn propor_e_validar(llm: &LlmClient, contexto: &str, npcs_presentes: &[&Npc]) -> Vec<MudancaProposta> {
+    let precos_conhecidos: HashMap<&str, u32> =
+        npcs_presentes.iter().flat_map(|n| n.precos.iter().map(|(item, preco)| (item.as_str(), *preco))).collect();
+
+    let propostas = propor_mudancas(llm, contexto).await;
+    if precos_conhecidos.is_empty() {
+        return propostas;
+    }
+
+    let paga_moedas = propostas.iter().any(|p| p.campo == "player.moedas" && p.operacao == "somar" && p.valor.as_i64().is_some_and(|v| v < 0));
+
+    let item_com_preco_sem_pagamento = propostas.iter().find_map(|p| {
+        if p.campo != "player.inventario" || p.operacao != "adicionar" {
+            return None;
+        }
+        let item = p.valor.as_str()?;
+        precos_conhecidos.get(item).map(|&preco| (item.to_string(), preco))
+    });
+
+    match item_com_preco_sem_pagamento {
+        Some((item, preco)) if !paga_moedas => {
+            let vendedor = npcs_presentes.iter().find(|n| n.precos.contains_key(&item)).map(|n| n.nome.as_str()).unwrap_or("o vendedor");
+            let entrada_corrigida = format!(
+                "{contexto}\n\nATENÇÃO: você propôs que o jogador ganhasse \"{item}\", que custa {preco} moedas na loja de {vendedor}. \
+                 Isso só é válido se o texto acima deixa claro que foi de graça, recompensa, achado ou roubado. Reescreva a lista de mudanças: \
+                 se foi uma compra normal, inclua também {{\"campo\": \"player.moedas\", \"operacao\": \"somar\", \"valor\": -{preco}}}. \
+                 Se não houve pagamento nem justificativa clara no texto original, remova a proposta de ganhar \"{item}\"."
+            );
+            tracing::info!(%item, preco, %vendedor, "state_changes: transacao sem contrapartida, pedindo correcao ao mestre de jogo");
+            propor_mudancas(llm, &entrada_corrigida).await
+        }
+        _ => propostas,
+    }
+}
+
 /// Aplica uma proposta ao Player em memória (o chamador é responsável por
 /// persistir depois). Retorna o evento `mudanca_estado` se aplicada, ou uma
 /// razão de rejeição em texto.
@@ -64,6 +108,9 @@ pub fn aplicar(player: &mut Player, turno: u64, proposta: &MudancaProposta) -> R
                 .ok_or_else(|| "valor de player.hp nao e um inteiro".to_string())?;
             let novo = (player.hp.atual as i64 + delta).clamp(0, player.hp.maximo as i64);
             let anterior = player.hp.atual;
+            if novo as i32 == anterior {
+                return Err("player.hp: proposta nao muda o valor atual (no-op), descartando".to_string());
+            }
             player.hp.atual = novo as i32;
             Ok(Event::new(
                 EventType::MudancaEstado,
@@ -72,25 +119,49 @@ pub fn aplicar(player: &mut Player, turno: u64, proposta: &MudancaProposta) -> R
                 serde_json::json!({ "campo": "player.hp", "operacao": "somar", "valor": delta, "anterior": anterior, "atual": player.hp.atual }),
             ))
         }
+        ("player.moedas", "somar") => {
+            let delta = proposta
+                .valor
+                .as_i64()
+                .ok_or_else(|| "valor de player.moedas nao e um inteiro".to_string())?;
+            let novo = (player.moedas as i64 + delta).max(0);
+            let anterior = player.moedas;
+            if novo as u32 == anterior {
+                return Err("player.moedas: proposta nao muda o valor atual (no-op), descartando".to_string());
+            }
+            player.moedas = novo as u32;
+            Ok(Event::new(
+                EventType::MudancaEstado,
+                "orquestrador",
+                turno,
+                serde_json::json!({ "campo": "player.moedas", "operacao": "somar", "valor": delta, "anterior": anterior, "atual": player.moedas }),
+            ))
+        }
         ("player.inventario", "adicionar") => {
             let item = proposta
                 .valor
                 .as_str()
                 .ok_or_else(|| "valor de player.inventario nao e uma string".to_string())?
                 .to_string();
-            match player.inventario.iter_mut().find(|i| i.nome == item) {
-                Some(existente) => existente.quantidade += 1,
-                None => player.inventario.push(ItemInventario {
-                    nome: item.clone(),
-                    quantidade: 1,
-                    categoria: proposta.categoria.clone().unwrap_or_default(),
-                }),
-            }
+            let quantidade = match player.inventario.iter_mut().find(|i| i.nome == item) {
+                Some(existente) => {
+                    existente.quantidade += 1;
+                    existente.quantidade
+                }
+                None => {
+                    player.inventario.push(ItemInventario {
+                        nome: item.clone(),
+                        quantidade: 1,
+                        categoria: proposta.categoria.clone().unwrap_or_default(),
+                    });
+                    1
+                }
+            };
             Ok(Event::new(
                 EventType::MudancaEstado,
                 "orquestrador",
                 turno,
-                serde_json::json!({ "campo": "player.inventario", "operacao": "adicionar", "valor": item }),
+                serde_json::json!({ "campo": "player.inventario", "operacao": "adicionar", "valor": item, "quantidade": quantidade }),
             ))
         }
         ("player.inventario", "remover") => {
@@ -105,14 +176,15 @@ pub fn aplicar(player: &mut Player, turno: u64, proposta: &MudancaProposta) -> R
                 .position(|i| i.nome == item)
                 .ok_or_else(|| format!("item '{item}' nao esta no inventario, rejeitando remocao"))?;
             player.inventario[pos].quantidade -= 1;
-            if player.inventario[pos].quantidade == 0 {
+            let quantidade = player.inventario[pos].quantidade;
+            if quantidade == 0 {
                 player.inventario.remove(pos);
             }
             Ok(Event::new(
                 EventType::MudancaEstado,
                 "orquestrador",
                 turno,
-                serde_json::json!({ "campo": "player.inventario", "operacao": "remover", "valor": item }),
+                serde_json::json!({ "campo": "player.inventario", "operacao": "remover", "valor": item, "quantidade": quantidade }),
             ))
         }
         ("player.location_id", "definir") => {
@@ -153,7 +225,77 @@ mod tests {
             classe: "guerreiro".into(),
             xp: 0,
             nome_personagem: None,
+            moedas: 15,
         }
+    }
+
+    #[test]
+    fn rejeita_hp_no_op_quando_ja_esta_no_maximo() {
+        let mut p = jogador();
+        p.hp.atual = p.hp.maximo;
+        let proposta = MudancaProposta { campo: "player.hp".into(), operacao: "somar".into(), valor: serde_json::json!(5), categoria: None };
+        assert!(aplicar(&mut p, 0, &proposta).is_err());
+        assert_eq!(p.hp.atual, p.hp.maximo);
+    }
+
+    #[test]
+    fn aplica_gasto_de_moedas_e_nao_deixa_negativo() {
+        let mut p = jogador();
+        let proposta = MudancaProposta { campo: "player.moedas".into(), operacao: "somar".into(), valor: serde_json::json!(-5), categoria: None };
+        aplicar(&mut p, 0, &proposta).unwrap();
+        assert_eq!(p.moedas, 10);
+
+        let proposta_excede = MudancaProposta { campo: "player.moedas".into(), operacao: "somar".into(), valor: serde_json::json!(-1000), categoria: None };
+        aplicar(&mut p, 0, &proposta_excede).unwrap();
+        assert_eq!(p.moedas, 0);
+    }
+
+    #[test]
+    fn rejeita_moedas_no_op() {
+        let mut p = jogador();
+        let proposta = MudancaProposta { campo: "player.moedas".into(), operacao: "somar".into(), valor: serde_json::json!(0), categoria: None };
+        assert!(aplicar(&mut p, 0, &proposta).is_err());
+    }
+
+    #[test]
+    fn evento_de_inventario_carrega_quantidade() {
+        let mut p = jogador();
+        let proposta = MudancaProposta { campo: "player.inventario".into(), operacao: "adicionar".into(), valor: serde_json::json!("cerveja"), categoria: Some("consumivel".into()) };
+        let evento = aplicar(&mut p, 0, &proposta).unwrap();
+        assert_eq!(evento.payload["quantidade"], 1);
+
+        let evento2 = aplicar(&mut p, 0, &proposta).unwrap();
+        assert_eq!(evento2.payload["quantidade"], 2);
+    }
+
+    fn npc_vendedor(nome: &str, item: &str, preco: u32) -> Npc {
+        use crate::state::NpcStatus;
+        Npc {
+            id: format!("npc_{nome}"),
+            nome: nome.into(),
+            status: NpcStatus::Vivo,
+            atitude_com_jogador: "neutro".into(),
+            location_id: "taverna".into(),
+            autonomo: true,
+            hp: None,
+            classe_armadura: None,
+            dano_dado_faces: None,
+            xp_recompensa: None,
+            loot: vec![],
+            descricao: String::new(),
+            deslocamento: None,
+            imunidades: vec![],
+            resistencias: vec![],
+            moedas: Some(50),
+            precos: [(item.to_string(), preco)].into_iter().collect(),
+            interesses: vec![],
+        }
+    }
+
+    #[test]
+    fn npc_vendedor_tem_preco_consultavel() {
+        let bram = npc_vendedor("bram", "cerveja", 5);
+        assert_eq!(bram.precos.get("cerveja"), Some(&5));
     }
 
     #[test]

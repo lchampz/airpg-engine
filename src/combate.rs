@@ -211,6 +211,7 @@ mod tests {
             classe: "guerreiro".into(),
             xp: 0,
             nome_personagem: None,
+            moedas: 15,
         }
     }
 
@@ -230,6 +231,9 @@ mod tests {
             descricao: String::new(),
             deslocamento: None,
             imunidades: vec![],
+            moedas: None,
+            precos: Default::default(),
+            interesses: vec![],
             resistencias: vec![],
         }
     }

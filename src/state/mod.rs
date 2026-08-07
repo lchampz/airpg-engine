@@ -19,6 +19,19 @@ pub struct Player {
     /// personagem ainda sem nome definido (ver Change-Ficha-Personagem).
     #[serde(default)]
     pub nome_personagem: Option<String>,
+    /// Ver Change-Economia-Viva-e-Consistencia. Ganhar um item numa transação
+    /// comercial exige gastar moeda em proposta simétrica — sem isso a
+    /// proposta de item é rejeitada (ver `state_changes::validar_transacao`).
+    #[serde(default = "moedas_iniciais")]
+    pub moedas: u32,
+}
+
+/// 15 moedas: dá pra pagar 2-3 rodadas de cerveja (5 moedas/copo, ver
+/// `npc_taverneiro_bram_seed` em `db.rs`) sem já chegar rico — decisão de
+/// design provisória, fácil de ajustar depois que o preço de mais itens
+/// existir.
+fn moedas_iniciais() -> u32 {
+    15
 }
 
 /// Ver Change-Inventario — item agregado por nome (quantidade, não entradas
@@ -71,6 +84,7 @@ impl Player {
             classe: "guerreiro".into(),
             xp: 0,
             nome_personagem: None,
+            moedas: moedas_iniciais(),
         }
     }
 }
@@ -114,6 +128,26 @@ pub struct Npc {
     pub imunidades: Vec<String>,
     #[serde(default)]
     pub resistencias: Vec<String>,
+    /// Ver Change-Economia-Viva-e-Consistencia. `None` = este NPC não
+    /// participa de transações comerciais (ex: Holt, o guarda). `Some` =
+    /// caixa dele, compartilhado entre TODOS os jogadores (a tabela `npcs`
+    /// já é global, não por jogador — duas pessoas comprando cerveja do
+    /// mesmo Bram concorrem pelo mesmo caixa, de propósito).
+    #[serde(default)]
+    pub moedas: Option<u32>,
+    /// Preço fixo por item que este NPC vende (ex: `{"cerveja": 5}`) —
+    /// decisão de produto: preço estruturado em vez de inferido pela IA a
+    /// cada venda, pra ser determinístico e não custar uma chamada de LLM
+    /// por transação.
+    #[serde(default)]
+    pub precos: std::collections::HashMap<String, u32>,
+    /// Motivações/necessidades genéricas do NPC (ex: "precisa de moedas para
+    /// pagar o fornecedor", "quer notícias do reino vizinho") — entram no
+    /// prompt de diálogo como personalidade/temperamento de base, sem exigir
+    /// um sistema de necessidades simulado turno a turno (isso é Fase 2, ver
+    /// Change-Economia-Viva-e-Consistencia).
+    #[serde(default)]
+    pub interesses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

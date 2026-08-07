@@ -72,6 +72,7 @@ mod tests {
             classe: "guerreiro".into(),
             xp: 0,
             nome_personagem: None,
+            moedas: 15,
         }
     }
 
@@ -104,6 +105,9 @@ mod tests {
                 deslocamento: None,
                 imunidades: vec![],
                 resistencias: vec![],
+                moedas: None,
+                precos: Default::default(),
+                interesses: vec![],
             })
             .collect();
         let roteados = orch.rotear_agentes(&p, &npcs);
