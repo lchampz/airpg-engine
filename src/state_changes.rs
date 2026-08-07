@@ -80,8 +80,8 @@ pub async fn propor_e_validar(llm: &LlmClient, contexto: &str, npcs_presentes: &
         precos_conhecidos.get(item).map(|&preco| (item.to_string(), preco))
     });
 
-    match item_com_preco_sem_pagamento {
-        Some((item, preco)) if !paga_moedas => {
+    if let Some((item, preco)) = item_com_preco_sem_pagamento {
+        if !paga_moedas {
             let vendedor = npcs_presentes.iter().find(|n| n.precos.contains_key(&item)).map(|n| n.nome.as_str()).unwrap_or("o vendedor");
             let entrada_corrigida = format!(
                 "{contexto}\n\nATENÇÃO: você propôs que o jogador ganhasse \"{item}\", que custa {preco} moedas na loja de {vendedor}. \
@@ -89,11 +89,43 @@ pub async fn propor_e_validar(llm: &LlmClient, contexto: &str, npcs_presentes: &
                  se foi uma compra normal, inclua também {{\"campo\": \"player.moedas\", \"operacao\": \"somar\", \"valor\": -{preco}}}. \
                  Se não houve pagamento nem justificativa clara no texto original, remova a proposta de ganhar \"{item}\"."
             );
-            tracing::info!(%item, preco, %vendedor, "state_changes: transacao sem contrapartida, pedindo correcao ao mestre de jogo");
-            propor_mudancas(llm, &entrada_corrigida).await
+            tracing::info!(%item, preco, %vendedor, "state_changes: item ganho sem contrapartida, pedindo correcao ao mestre de jogo");
+            return propor_mudancas(llm, &entrada_corrigida).await;
         }
-        _ => propostas,
     }
+
+    // Caso simétrico: o jogador pagou um valor que bate exatamente com o
+    // preço de algum item conhecido, mas o item nunca foi proposto pro
+    // inventário — pagamento "no vazio". Mesma filosofia: o Mestre de Jogo
+    // reescreve, o código nunca insere o item sozinho.
+    let valor_pago = propostas
+        .iter()
+        .find(|p| p.campo == "player.moedas" && p.operacao == "somar")
+        .and_then(|p| p.valor.as_i64())
+        .filter(|v| *v < 0)
+        .map(|v| (-v) as u32);
+
+    if let Some(preco_pago) = valor_pago {
+        let item_correspondente = precos_conhecidos.iter().find(|(_, &preco)| preco == preco_pago).map(|(&item, _)| item);
+        if let Some(item) = item_correspondente {
+            let ja_ganha_este_item = propostas
+                .iter()
+                .any(|p| p.campo == "player.inventario" && p.operacao == "adicionar" && p.valor.as_str() == Some(item));
+            if !ja_ganha_este_item {
+                let vendedor = npcs_presentes.iter().find(|n| n.precos.get(item) == Some(&preco_pago)).map(|n| n.nome.as_str()).unwrap_or("o vendedor");
+                let entrada_corrigida = format!(
+                    "{contexto}\n\nATENÇÃO: você propôs debitar {preco_pago} moedas do jogador — valor que corresponde exatamente ao preço de \"{item}\" \
+                     cobrado por {vendedor} — mas não incluiu a proposta de adicionar \"{item}\" ao inventário do jogador. Reescreva a lista de mudanças \
+                     incluindo também {{\"campo\": \"player.inventario\", \"operacao\": \"adicionar\", \"valor\": \"{item}\", \"categoria\": \"consumivel\"}}, \
+                     a menos que o texto deixe claro que o pagamento foi por outro motivo (ex: multa, aluguel, gorjeta) e não por esse item."
+                );
+                tracing::info!(%item, preco_pago, %vendedor, "state_changes: pagamento sem item correspondente, pedindo correcao ao mestre de jogo");
+                return propor_mudancas(llm, &entrada_corrigida).await;
+            }
+        }
+    }
+
+    propostas
 }
 
 /// Aplica uma proposta ao Player em memória (o chamador é responsável por
