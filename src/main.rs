@@ -47,6 +47,11 @@ struct AppState {
 struct TurnResult {
     turno: u64,
     eventos: Vec<Event>,
+    /// Ids de todos os NPCs roteados pro turno (ver
+    /// Change-Chat-Multiplos-Agentes-Proximidade) — não só os que geraram
+    /// diálogo, pra popular "quem está na sala" no frontend.
+    #[serde(default)]
+    presentes: Vec<String>,
 }
 
 #[tokio::main]
@@ -93,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/npcs", get(listar_npcs))
         .route("/npcs/:id", get(obter_npc))
         .route("/combate", get(obter_combate))
+        .route("/historico", get(obter_historico))
         .route("/cenas/:location_id/fatos", post(adicionar_fato_a_cena))
         .layer(cors)
         .with_state(state);
@@ -154,6 +160,13 @@ async fn obter_npc(State(app): State<AppState>, Path(id): Path<String>) -> Json<
 async fn obter_combate(State(app): State<AppState>, headers: HeaderMap) -> Json<Option<state::Combate>> {
     let player_id = player_id_de(&headers);
     Json(db::get_combate(&app.pool, &player_id).await.unwrap_or(None))
+}
+
+/// Ver Change-Chat-Screen: histórico persistido de eventos do jogador, pra
+/// reconstruir o chat ao recarregar a página. Últimos 100 eventos.
+async fn obter_historico(State(app): State<AppState>, headers: HeaderMap) -> Json<Vec<Event>> {
+    let player_id = player_id_de(&headers);
+    Json(db::historico_do_jogador(&app.pool, &player_id, 100).await.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -229,6 +242,8 @@ async fn processar_turno(
 
     let combate_ativo = db::get_combate(&app.pool, &player_id).await.ok().flatten();
 
+    let mut presentes: Vec<String> = Vec::new();
+
     let eventos = match app.orchestrator.validar_acao(&player, &acao) {
         Err(rejeicao) => vec![Event::new(
             EventType::AcaoRejeitada,
@@ -266,6 +281,7 @@ async fn processar_turno(
 
             let npcs = db::list_npcs(&app.pool).await.unwrap_or_default();
             let roteados = app.orchestrator.rotear_agentes(&player, &npcs);
+            presentes = roteados.iter().map(|n| n.id.clone()).collect();
 
             tracing::info!(
                 turno,
@@ -382,9 +398,13 @@ async fn processar_turno(
         }
     };
 
+    if let Err(err) = db::registrar_eventos_historico(&app.pool, &player_id, &eventos).await {
+        tracing::warn!(%err, %player_id, "falha ao registrar historico de eventos");
+    }
+
     publicar_lote(&app, &eventos).await;
 
-    Json(TurnResult { turno, eventos })
+    Json(TurnResult { turno, eventos, presentes })
 }
 
 /// Turno dentro de um combate ativo: classifica a ação (atacar/fugir/outro)
