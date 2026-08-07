@@ -1,6 +1,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub mod srd_tables;
+
 /// Skills são determinísticas por padrão (ver Subagentes-e-Skills / Decisoes-Resolvidas).
 /// `skill_dados` é o exemplo canônico: rolagem de dados / teste de atributo nunca é
 /// decidido por geração de texto, sempre por esta função.
@@ -21,12 +23,21 @@ pub struct ResultadoDados {
 pub fn skill_rolar_dado(faces: u32, seed: u64) -> u32 {
     // Gerador determinístico simples (LCG) para manter a skill previsível/testável.
     // Em produção o seed vem de `rand::random()` (aleatoriedade real), não fixo.
-    ((seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) % faces as u64 + 1) as u32
+    ((seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407))
+        % faces as u64
+        + 1) as u32
 }
 
 pub fn skill_dados(dificuldade: u32, seed: u64) -> ResultadoDados {
     let rolagem = skill_rolar_dado(20, seed);
-    ResultadoDados { schema_version: SKILL_DADOS_VERSION, rolagem, dificuldade, sucesso: rolagem >= dificuldade }
+    ResultadoDados {
+        schema_version: SKILL_DADOS_VERSION,
+        rolagem,
+        dificuldade,
+        sucesso: rolagem >= dificuldade,
+    }
 }
 
 #[cfg(test)]

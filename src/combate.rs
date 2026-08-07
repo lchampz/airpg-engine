@@ -2,6 +2,7 @@ use crate::db;
 use crate::events::Event;
 use crate::events::EventType;
 use crate::skills::skill_rolar_dado;
+use crate::skills::srd_tables::skill_resolver_resistencia;
 use crate::state::{nivel_por_xp, Combate, ItemInventario, Npc, Player, PLAYER_CA_PADRAO};
 use sqlx::sqlite::SqlitePool;
 
@@ -13,6 +14,12 @@ use sqlx::sqlite::SqlitePool;
 /// resultado numérico em si (mesmo princípio do sistema de testes de dados).
 const DANO_JOGADOR_FACES_PADRAO: u32 = 6;
 const DIFICULDADE_FUGA_PADRAO: u32 = 12;
+/// O jogador ainda não tem sistema de arma/tipo de dano escolhido (fora de
+/// escopo aqui) — ataque básico assumido como cortante (arma branca padrão),
+/// o suficiente pra `Npc.resistencias`/`imunidades` do bestiário (ver
+/// Change-Bestiario) finalmente terem efeito mecânico real em combate, em vez
+/// de só descritivo.
+const TIPO_DANO_ATAQUE_JOGADOR: &str = "cortante";
 
 pub enum TipoAcaoCombate {
     Atacar,
@@ -29,17 +36,29 @@ pub struct ResultadoRodada {
 /// Change-Sistema-de-Combate — `Option` é proposital, nem todo NPC é
 /// combatente).
 pub fn npcs_combatentes<'a>(npcs: &'a [Npc]) -> Vec<&'a Npc> {
-    npcs.iter().filter(|n| n.hp.is_some() && n.status != crate::state::NpcStatus::Morto).collect()
+    npcs.iter()
+        .filter(|n| n.hp.is_some() && n.status != crate::state::NpcStatus::Morto)
+        .collect()
 }
 
-pub async fn iniciar(pool: &SqlitePool, player_id: &str, npc_id: &str, seed: u64) -> anyhow::Result<Combate> {
+pub async fn iniciar(
+    pool: &SqlitePool,
+    player_id: &str,
+    npc_id: &str,
+    seed: u64,
+) -> anyhow::Result<Combate> {
     // Iniciativa é só flavour no MVP (rodadas resolvem os dois lados no mesmo
     // turno) — rolada mesmo assim para manter o conceito presente e permitir
     // evoluir para ordem real depois sem quebrar o schema.
     let _iniciativa_jogador = skill_rolar_dado(20, seed);
     let _iniciativa_npc = skill_rolar_dado(20, seed.wrapping_add(1));
 
-    let combate = Combate { player_id: player_id.to_string(), npc_id: npc_id.to_string(), rodada: 1, ativo: true };
+    let combate = Combate {
+        player_id: player_id.to_string(),
+        npc_id: npc_id.to_string(),
+        rodada: 1,
+        ativo: true,
+    };
     db::salvar_combate(pool, &combate).await?;
     Ok(combate)
 }
@@ -59,7 +78,9 @@ pub fn resolver_rodada(
     let mut eventos = Vec::new();
     let mut seed = seed;
     let mut proximo_seed = || {
-        seed = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+        seed = seed
+            .wrapping_mul(2862933555777941757)
+            .wrapping_add(3037000493);
         seed
     };
 
@@ -81,7 +102,10 @@ pub fn resolver_rodada(
                 turno,
                 serde_json::json!({ "npc_id": npc.id, "motivo": "jogador_fugiu" }),
             ));
-            return ResultadoRodada { eventos, combate_encerrado: true };
+            return ResultadoRodada {
+                eventos,
+                combate_encerrado: true,
+            };
         }
         // Fuga falhou: o NPC ainda ataca de volta abaixo.
     }
@@ -92,8 +116,15 @@ pub fn resolver_rodada(
         let acertou = rolagem >= ca_npc;
 
         let mut dano_aplicado = 0;
+        let mut dano_bruto = 0;
         if acertou {
-            dano_aplicado = skill_rolar_dado(DANO_JOGADOR_FACES_PADRAO, proximo_seed()) as i32;
+            dano_bruto = skill_rolar_dado(DANO_JOGADOR_FACES_PADRAO, proximo_seed()) as i32;
+            let multiplicador = skill_resolver_resistencia(
+                TIPO_DANO_ATAQUE_JOGADOR,
+                &npc.imunidades,
+                &npc.resistencias,
+            );
+            dano_aplicado = multiplicador.aplicar(dano_bruto);
             if let Some(hp) = &mut npc.hp {
                 hp.atual = (hp.atual - dano_aplicado).max(0);
             }
@@ -103,7 +134,7 @@ pub fn resolver_rodada(
             EventType::AtaqueResolvido,
             player.id.clone(),
             turno,
-            serde_json::json!({ "tipo": "ataque", "alvo": npc.id, "rolagem": rolagem, "ca_alvo": ca_npc, "acerto": acertou, "dano_aplicado": dano_aplicado }),
+            serde_json::json!({ "tipo": "ataque", "alvo": npc.id, "rolagem": rolagem, "ca_alvo": ca_npc, "acerto": acertou, "dano_tipo": TIPO_DANO_ATAQUE_JOGADOR, "dano_bruto": dano_bruto, "dano_aplicado": dano_aplicado }),
         ));
 
         if let Some(hp) = &npc.hp {
@@ -117,7 +148,10 @@ pub fn resolver_rodada(
                     turno,
                     serde_json::json!({ "npc_id": npc.id, "motivo": "inimigo_derrotado" }),
                 ));
-                return ResultadoRodada { eventos, combate_encerrado: true };
+                return ResultadoRodada {
+                    eventos,
+                    combate_encerrado: true,
+                };
             }
         }
     }
@@ -141,18 +175,29 @@ pub fn resolver_rodada(
 
     if player.hp.atual == 0 {
         combate.ativo = false;
-        eventos.push(Event::new(EventType::JogadorMorreu, "orquestrador", turno, serde_json::json!({ "causa": format!("combate contra {}", npc.nome) })));
+        eventos.push(Event::new(
+            EventType::JogadorMorreu,
+            "orquestrador",
+            turno,
+            serde_json::json!({ "causa": format!("combate contra {}", npc.nome) }),
+        ));
         eventos.push(Event::new(
             EventType::CombateEncerrado,
             "orquestrador",
             turno,
             serde_json::json!({ "npc_id": npc.id, "motivo": "jogador_morreu" }),
         ));
-        return ResultadoRodada { eventos, combate_encerrado: true };
+        return ResultadoRodada {
+            eventos,
+            combate_encerrado: true,
+        };
     }
 
     combate.rodada += 1;
-    ResultadoRodada { eventos, combate_encerrado: false }
+    ResultadoRodada {
+        eventos,
+        combate_encerrado: false,
+    }
 }
 
 /// XP e loot são dados fixos do próprio NPC, não uma proposta do LLM — sem
@@ -184,7 +229,11 @@ fn aplicar_recompensa(player: &mut Player, npc: &Npc, turno: u64, eventos: &mut 
     for item in &npc.loot {
         match player.inventario.iter_mut().find(|i| &i.nome == item) {
             Some(existente) => existente.quantidade += 1,
-            None => player.inventario.push(ItemInventario { nome: item.clone(), quantidade: 1, categoria: String::new() }),
+            None => player.inventario.push(ItemInventario {
+                nome: item.clone(),
+                quantidade: 1,
+                categoria: String::new(),
+            }),
         }
         eventos.push(Event::new(
             EventType::MudancaEstado,
@@ -203,7 +252,10 @@ mod tests {
     fn jogador() -> Player {
         Player {
             id: "p1".into(),
-            hp: Hp { atual: 10, maximo: 10 },
+            hp: Hp {
+                atual: 10,
+                maximo: 10,
+            },
             atributos: Default::default(),
             inventario: vec![],
             location_id: "arena".into(),
@@ -223,7 +275,10 @@ mod tests {
             atitude_com_jogador: "hostil".into(),
             location_id: "arena".into(),
             autonomo: false,
-            hp: Some(Hp { atual: 12, maximo: 12 }),
+            hp: Some(Hp {
+                atual: 12,
+                maximo: 12,
+            }),
             classe_armadura: Some(12),
             dano_dado_faces: Some(4),
             xp_recompensa: Some(50),
@@ -239,7 +294,12 @@ mod tests {
     }
 
     fn combate() -> Combate {
-        Combate { player_id: "p1".into(), npc_id: "npc_lobo".into(), rodada: 1, ativo: true }
+        Combate {
+            player_id: "p1".into(),
+            npc_id: "npc_lobo".into(),
+            rodada: 1,
+            ativo: true,
+        }
     }
 
     #[test]
@@ -261,7 +321,10 @@ mod tests {
         let mut c = combate();
         let mut p = jogador();
         let mut n = lobo();
-        n.hp = Some(Hp { atual: 1, maximo: 12 });
+        n.hp = Some(Hp {
+            atual: 1,
+            maximo: 12,
+        });
 
         let mut seed = 7u64;
         let mut encerrado = false;
@@ -280,7 +343,10 @@ mod tests {
                 break;
             }
         }
-        assert!(encerrado, "combate deveria ter encerrado em 30 rodadas (jogador ou npc morre)");
+        assert!(
+            encerrado,
+            "combate deveria ter encerrado em 30 rodadas (jogador ou npc morre)"
+        );
     }
 
     #[test]
@@ -297,5 +363,82 @@ mod tests {
             }
         }
         panic!("nenhum seed testado produziu fuga bem sucedida — heurística pode estar errada");
+    }
+
+    #[test]
+    fn npc_resistente_ao_tipo_de_dano_do_ataque_recebe_metade_do_dano() {
+        // Mesma seed em dois combates idênticos, só variando `resistencias` —
+        // isolando o efeito da resistência do resto da aleatoriedade da rodada.
+        for seed in 0..200 {
+            let mut c1 = combate();
+            let mut p1 = jogador();
+            let mut n_normal = lobo();
+
+            let mut c2 = combate();
+            let mut p2 = jogador();
+            let mut n_resistente = lobo();
+            n_resistente.resistencias = vec!["cortante".into()];
+
+            let r_normal = resolver_rodada(
+                &mut c1,
+                &mut p1,
+                &mut n_normal,
+                TipoAcaoCombate::Atacar,
+                0,
+                seed,
+            );
+            let r_resistente = resolver_rodada(
+                &mut c2,
+                &mut p2,
+                &mut n_resistente,
+                TipoAcaoCombate::Atacar,
+                0,
+                seed,
+            );
+
+            let dano_normal = n_normal
+                .hp
+                .as_ref()
+                .map(|h| lobo().hp.unwrap().atual - h.atual)
+                .unwrap_or(0);
+            let dano_resistente = n_resistente
+                .hp
+                .as_ref()
+                .map(|h| lobo().hp.unwrap().atual - h.atual)
+                .unwrap_or(0);
+
+            if dano_normal > 0 {
+                assert_eq!(
+                    dano_resistente,
+                    dano_normal / 2,
+                    "resistencia deveria reduzir o dano à metade (seed {seed})"
+                );
+                let _ = (r_normal, r_resistente);
+                return;
+            }
+        }
+        panic!("nenhum seed testado produziu um acerto — não deu pra validar a resistência");
+    }
+
+    #[test]
+    fn npc_imune_ao_tipo_de_dano_nao_perde_hp() {
+        let mut c = combate();
+        let mut p = jogador();
+        let mut n = lobo();
+        n.imunidades = vec!["cortante".into()];
+        let hp_inicial = n.hp.as_ref().unwrap().atual;
+
+        for seed in 0..50 {
+            let r = resolver_rodada(&mut c, &mut p, &mut n, TipoAcaoCombate::Atacar, 0, seed);
+            if r.combate_encerrado {
+                break;
+            }
+        }
+
+        assert_eq!(
+            n.hp.as_ref().unwrap().atual,
+            hp_inicial,
+            "npc imune ao tipo de dano do ataque nao deveria perder HP"
+        );
     }
 }
