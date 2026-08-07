@@ -21,3 +21,4 @@ reqwest = { version = "0.12", features = ["json"] }
 async-nats = "0.35"
 futures = "0.3"
 tower-http = { version = "0.6", features = ["cors"] }
+rand = "0.8"

@@ -78,4 +78,7 @@ pub struct MudancaEstadoPayload {
 pub struct ColisaoJogadorAgentePayload {
     pub agent_id: String,
     pub location_id: String,
+    /// Qual jogador colidiu — necessário desde que o Mundo Vivo passou a
+    /// rastrear múltiplos jogadores (ver Change-Sessoes-Multiusuario).
+    pub player_id: String,
 }

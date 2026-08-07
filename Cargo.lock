@@ -33,6 +33,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
+ "rand",
  "reqwest",
  "schemars",
  "serde",

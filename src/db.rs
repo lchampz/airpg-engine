@@ -1,4 +1,4 @@
-use crate::state::{Npc, Player};
+use crate::state::{Cena, MemoriaNpc, Npc, Player};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
 /// Estado Rígido persiste em SQLite no MVP (ver Stack-Escolhida / Estado-Rigido).
@@ -31,15 +31,33 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
-    // Memória de curto prazo por agente (ctx/last-interaction), ver
-    // Memoria-Narrativa no vault. Efêmera por natureza — perder isso num
-    // restart é aceitável, mas persistir evita reiniciar toda conversa a
-    // cada `docker compose up` durante o desenvolvimento.
+    migrar_npc_memoria(&pool).await?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS npc_memoria (
-            npc_id TEXT PRIMARY KEY,
-            ctx TEXT NOT NULL
+            npc_id TEXT NOT NULL,
+            player_id TEXT NOT NULL,
+            ctx TEXT NOT NULL,
+            resumo TEXT NOT NULL DEFAULT '',
+            estado_emocional TEXT NOT NULL DEFAULT '{}',
+            turnos_desde_consolidacao INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (npc_id, player_id)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // Cena: fato objetivo de um location_id, criado pelo Mestre de Jogo (ver
+    // Mestre-de-Jogo-e-Cena no vault) — nunca por um NPC individual.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cenas (
+            location_id TEXT PRIMARY KEY,
+            nome TEXT NOT NULL,
+            descricao TEXT NOT NULL,
+            fatos TEXT NOT NULL DEFAULT '[]'
         )
         "#,
     )
@@ -51,6 +69,29 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     Ok(pool)
 }
 
+/// `npc_memoria` mudou de esquema (chave composta npc_id+player_id, campos
+/// novos) durante o desenvolvimento pré-lançamento. Memória de curto prazo é
+/// efêmera por natureza (ver Memoria-Narrativa) — recriar a tabela e perder
+/// memória antiga é aceitável, não há usuário real ainda.
+async fn migrar_npc_memoria(pool: &SqlitePool) -> anyhow::Result<()> {
+    let existe: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='npc_memoria'",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    if existe.is_some() {
+        let colunas: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as("PRAGMA table_info(npc_memoria)").fetch_all(pool).await?;
+        let tem_player_id = colunas.iter().any(|(_, nome, ..)| nome == "player_id");
+        if !tem_player_id {
+            sqlx::query("DROP TABLE npc_memoria").execute(pool).await?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Seed mínimo para permitir testar o roteamento real (cap de agentes/turno,
 /// ver Decisoes-Resolvidas) sem depender ainda de um fluxo de criação de
 /// campanha. Só popula se as tabelas estiverem vazias — não sobrescreve.
@@ -60,16 +101,7 @@ async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let player = Player {
-        id: "player_01".into(),
-        hp: crate::state::Hp { atual: 10, maximo: 10 },
-        atributos: Default::default(),
-        inventario: vec![],
-        location_id: "taverna_porto_velho".into(),
-        nivel: 1,
-        classe: "guerreiro".into(),
-    };
-    upsert_player(pool, &player).await?;
+    upsert_player(pool, &Player::seed("player_01")).await?;
 
     let npcs = vec![
         Npc {
@@ -114,12 +146,23 @@ pub async fn upsert_player(pool: &SqlitePool, player: &Player) -> anyhow::Result
     Ok(())
 }
 
-pub async fn get_player(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<Player>> {
+/// Diferente da versão inicial (single-player fixo), agora **cria** o jogador
+/// com estado padrão na primeira vez que um `id` desconhecido aparece — ver
+/// Change-Sessoes-Multiusuario. Nunca retorna `None`.
+pub async fn get_ou_criar_player(pool: &SqlitePool, id: &str) -> anyhow::Result<Player> {
     let row: Option<(String,)> = sqlx::query_as("SELECT data FROM players WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
         .await?;
-    Ok(row.map(|(data,)| serde_json::from_str(&data)).transpose()?)
+
+    match row {
+        Some((data,)) => Ok(serde_json::from_str(&data)?),
+        None => {
+            let player = Player::seed(id);
+            upsert_player(pool, &player).await?;
+            Ok(player)
+        }
+    }
 }
 
 pub async fn upsert_npc(pool: &SqlitePool, npc: &Npc) -> anyhow::Result<()> {
@@ -145,32 +188,91 @@ pub async fn list_npcs(pool: &SqlitePool) -> anyhow::Result<Vec<Npc>> {
     rows.into_iter().map(|(data,)| serde_json::from_str(&data).map_err(Into::into)).collect()
 }
 
-/// Máximo de trocas (prompt+resposta) mantidas por agente — memória de curto
-/// prazo tem limite natural de tamanho (ver Memoria-Narrativa no vault).
-pub const MAX_TROCAS_MEMORIA: usize = 6;
+/// Máximo de trocas (prompt+resposta) mantidas na janela verbatim — o resto
+/// vira resumo/estado emocional na consolidação (ver Memoria-em-Camadas).
+pub const MAX_TROCAS_MEMORIA: usize = 3;
+/// A cada quantos turnos a memória de um par (NPC, jogador) é consolidada.
+pub const TURNOS_POR_CONSOLIDACAO: u32 = 5;
 
-pub async fn get_memoria(pool: &SqlitePool, npc_id: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let row: Option<(String,)> = sqlx::query_as("SELECT ctx FROM npc_memoria WHERE npc_id = ?")
-        .bind(npc_id)
-        .fetch_optional(pool)
-        .await?;
+pub async fn get_memoria(pool: &SqlitePool, npc_id: &str, player_id: &str) -> anyhow::Result<MemoriaNpc> {
+    let row: Option<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT ctx, resumo, estado_emocional, turnos_desde_consolidacao FROM npc_memoria WHERE npc_id = ? AND player_id = ?",
+    )
+    .bind(npc_id)
+    .bind(player_id)
+    .fetch_optional(pool)
+    .await?;
+
     Ok(match row {
-        Some((ctx,)) => serde_json::from_str(&ctx)?,
-        None => vec![],
+        Some((ctx, resumo, estado, turnos)) => MemoriaNpc {
+            ctx: serde_json::from_str(&ctx)?,
+            resumo,
+            estado_emocional: serde_json::from_str(&estado).unwrap_or_default(),
+            turnos_desde_consolidacao: turnos as u32,
+        },
+        None => MemoriaNpc::default(),
     })
 }
 
-pub async fn registrar_troca(pool: &SqlitePool, npc_id: &str, prompt: String, resposta: String) -> anyhow::Result<()> {
-    let mut ctx = get_memoria(pool, npc_id).await?;
-    ctx.push((prompt, resposta));
-    if ctx.len() > MAX_TROCAS_MEMORIA {
-        ctx.drain(0..ctx.len() - MAX_TROCAS_MEMORIA);
-    }
-    let data = serde_json::to_string(&ctx)?;
-    sqlx::query("INSERT INTO npc_memoria (npc_id, ctx) VALUES (?, ?) ON CONFLICT(npc_id) DO UPDATE SET ctx = excluded.ctx")
-        .bind(npc_id)
-        .bind(data)
-        .execute(pool)
-        .await?;
+pub async fn salvar_memoria(pool: &SqlitePool, npc_id: &str, player_id: &str, memoria: &MemoriaNpc) -> anyhow::Result<()> {
+    let ctx = serde_json::to_string(&memoria.ctx)?;
+    let estado = serde_json::to_string(&memoria.estado_emocional)?;
+    sqlx::query(
+        "INSERT INTO npc_memoria (npc_id, player_id, ctx, resumo, estado_emocional, turnos_desde_consolidacao) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(npc_id, player_id) DO UPDATE SET ctx = excluded.ctx, resumo = excluded.resumo, estado_emocional = excluded.estado_emocional, turnos_desde_consolidacao = excluded.turnos_desde_consolidacao",
+    )
+    .bind(npc_id)
+    .bind(player_id)
+    .bind(ctx)
+    .bind(&memoria.resumo)
+    .bind(estado)
+    .bind(memoria.turnos_desde_consolidacao as i64)
+    .execute(pool)
+    .await?;
     Ok(())
 }
+
+/// Registra uma troca na janela verbatim e incrementa o contador de
+/// consolidação. Não persiste sozinho — o chamador decide se consolida antes
+/// de persistir (ver `reacoes::processar_interacao`).
+pub fn registrar_troca(memoria: &mut MemoriaNpc, prompt: String, resposta: String) {
+    memoria.ctx.push((prompt, resposta));
+    if memoria.ctx.len() > MAX_TROCAS_MEMORIA {
+        memoria.ctx.drain(0..memoria.ctx.len() - MAX_TROCAS_MEMORIA);
+    }
+    memoria.turnos_desde_consolidacao += 1;
+}
+
+pub async fn get_cena(pool: &SqlitePool, location_id: &str) -> anyhow::Result<Option<Cena>> {
+    let row: Option<(String, String, String)> =
+        sqlx::query_as("SELECT nome, descricao, fatos FROM cenas WHERE location_id = ?")
+            .bind(location_id)
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(match row {
+        Some((nome, descricao, fatos)) => Some(Cena {
+            location_id: location_id.to_string(),
+            nome,
+            descricao,
+            fatos_estabelecidos: serde_json::from_str(&fatos)?,
+        }),
+        None => None,
+    })
+}
+
+pub async fn upsert_cena(pool: &SqlitePool, cena: &Cena) -> anyhow::Result<()> {
+    let fatos = serde_json::to_string(&cena.fatos_estabelecidos)?;
+    sqlx::query(
+        "INSERT INTO cenas (location_id, nome, descricao, fatos) VALUES (?, ?, ?, ?)
+         ON CONFLICT(location_id) DO UPDATE SET nome = excluded.nome, descricao = excluded.descricao, fatos = excluded.fatos",
+    )
+    .bind(&cena.location_id)
+    .bind(&cena.nome)
+    .bind(&cena.descricao)
+    .bind(fatos)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
