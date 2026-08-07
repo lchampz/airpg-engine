@@ -59,9 +59,20 @@ async fn dialogar(
         Ok(texto) => texto,
         Err(err) => {
             tracing::error!(%err, npc = %npc.id, "falha ao chamar o LLM para dialogo do agente");
-            return format!("{} hesita, sem saber o que responder.", npc.nome);
+            return format!("*{} hesita, sem saber o que responder.*", npc.nome);
         }
     };
+
+    // Checagem de formato (*ação*/-fala) é só observabilidade por ora, não
+    // reprovação — o guardrail de saída (llama3.2 local) já rejeita respostas
+    // válidas com frequência alta por outros critérios (ver Memoria-Narrativa
+    // no vault); adicionar mais um motivo de reprovação numa chamada que já é
+    // frágil arriscava piorar a taxa de fallback em vez de melhorar a
+    // formatação. O parser do frontend já trata texto sem marcadores como
+    // fala simples, então a UI não quebra de qualquer forma.
+    if !bruto.contains('*') && !bruto.contains('-') {
+        tracing::debug!(npc = %npc.id, "resposta sem marcadores de acao/fala (*acao*/-fala)");
+    }
 
     guardrail.revisar(&bruto, resultado_dados).await
 }
@@ -109,6 +120,12 @@ fn montar_system_prompt(npc: &Npc, cena: &Cena, memoria: &MemoriaNpc, resultado_
 
     partes.push(
         "Mantenha consistência com o que você mesmo disse antes e com os fatos estabelecidos. Responda em 1-2 frases curtas, em português, sempre em personagem, nunca saindo do papel.".to_string(),
+    );
+
+    partes.push(
+        "FORMATO OBRIGATÓRIO: use *ação* para narrar gesto/expressão (sem aspas), e -fala para diálogo direto (traço no início da frase, sem aspas). \
+         Pode misturar os dois. Exemplos: '*cruza os braços* -Não recebo estranhos de bom grado.' ou '-Saia daqui. *aponta para a porta*'."
+            .to_string(),
     );
 
     partes.join("\n\n")

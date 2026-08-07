@@ -1,3 +1,4 @@
+mod combate;
 mod consolidacao;
 mod db;
 mod events;
@@ -88,8 +89,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/turn", post(processar_turno))
         .route("/player", get(obter_player))
+        .route("/player/reiniciar", post(reiniciar_jogador))
         .route("/npcs", get(listar_npcs))
         .route("/npcs/:id", get(obter_npc))
+        .route("/combate", get(obter_combate))
+        .route("/cenas/:location_id/fatos", post(adicionar_fato_a_cena))
         .layer(cors)
         .with_state(state);
 
@@ -135,6 +139,60 @@ async fn obter_npc(State(app): State<AppState>, Path(id): Path<String>) -> Json<
     Json(db::get_npc(&app.pool, &id).await.unwrap_or(None))
 }
 
+async fn obter_combate(State(app): State<AppState>, headers: HeaderMap) -> Json<Option<state::Combate>> {
+    let player_id = player_id_de(&headers);
+    Json(db::get_combate(&app.pool, &player_id).await.unwrap_or(None))
+}
+
+#[derive(Deserialize)]
+struct NovoFatoPayload {
+    fato: String,
+}
+
+/// Recebe fatos da simulação de mundo em background (ver
+/// Change-Simulacao-Mundo-Background, `airpg-world`/`RegiaoMacro`). Só
+/// adiciona a uma Cena que já existe — nunca cria uma nova aqui.
+async fn adicionar_fato_a_cena(
+    State(app): State<AppState>,
+    Path(location_id): Path<String>,
+    Json(payload): Json<NovoFatoPayload>,
+) -> axum::http::StatusCode {
+    match db::adicionar_fato_a_cena(&app.pool, &location_id, &payload.fato).await {
+        Ok(true) => axum::http::StatusCode::OK,
+        Ok(false) => axum::http::StatusCode::NOT_FOUND,
+        Err(err) => {
+            tracing::error!(%err, %location_id, "falha ao adicionar fato a cena");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ReiniciarPayload {
+    escopo: String,
+}
+
+/// Ver Change-Fluxo-de-Morte: dois caminhos de reinício. "jogador" apaga só o
+/// registro daquele player_id (o mundo/NPCs continuam intactos). "mundo"
+/// apaga tudo — é destrutivo para QUALQUER jogador na mesma instância, não só
+/// quem morreu (decisão de produto em aberto se isso deveria existir em
+/// produção multiusuário, ver o change).
+async fn reiniciar_jogador(State(app): State<AppState>, headers: HeaderMap, Json(payload): Json<ReiniciarPayload>) -> Json<state::Player> {
+    let player_id = player_id_de(&headers);
+
+    if payload.escopo == "mundo" {
+        if let Err(err) = db::reiniciar_mundo(&app.pool).await {
+            tracing::error!(%err, "falha ao reiniciar o mundo");
+        }
+    } else if let Err(err) = db::reiniciar_dados_do_jogador(&app.pool, &player_id).await {
+        tracing::error!(%err, %player_id, "falha ao reiniciar jogador");
+    }
+
+    let novo = state::Player::seed(&player_id);
+    let _ = db::upsert_player(&app.pool, &novo).await;
+    Json(novo)
+}
+
 /// Endpoint de turno: valida a ação (Guardrail de Entrada), resolve a Cena do
 /// Mestre de Jogo para a location do jogador, roteia até MAX_AGENTES_POR_TURNO
 /// NPCs presentes ali (ver Orquestrador-Central / Decisoes-Resolvidas), gera a
@@ -157,6 +215,8 @@ async fn processar_turno(
         }
     };
 
+    let combate_ativo = db::get_combate(&app.pool, &player_id).await.ok().flatten();
+
     let eventos = match app.orchestrator.validar_acao(&player, &acao) {
         Err(rejeicao) => vec![Event::new(
             EventType::AcaoRejeitada,
@@ -164,6 +224,9 @@ async fn processar_turno(
             turno,
             serde_json::to_value(&rejeicao).unwrap(),
         )],
+        Ok(()) if combate_ativo.is_some() => {
+            processar_turno_de_combate(&app, turno, &player_id, &mut player, combate_ativo.unwrap(), &acao).await
+        }
         Ok(()) => {
             let cena = mestre::resolver_cena(&app.pool, &app.llm, &player.location_id).await;
 
@@ -246,6 +309,7 @@ async fn processar_turno(
                 acao.response,
                 respostas.iter().map(|(id, t)| format!("{id} disse: {t}")).collect::<Vec<_>>().join("\n")
             );
+            let hp_antes_das_propostas = player.hp.atual;
             let propostas = state_changes::propor_mudancas(&app.llm, &contexto).await;
             for proposta in &propostas {
                 match state_changes::aplicar(&mut player, turno, proposta) {
@@ -259,6 +323,37 @@ async fn processar_turno(
                 }
             }
 
+            // Morte por dano ambiental (não-combate) — ver Change-Fluxo-de-Morte.
+            // Morte em combate é detectada dentro de `combate::resolver_rodada`.
+            if hp_antes_das_propostas > 0 && player.hp.atual == 0 {
+                eventos.push(Event::new(EventType::JogadorMorreu, "orquestrador", turno, serde_json::json!({ "causa": "dano ambiental" })));
+            }
+
+            // Início de combate: o Mestre de Jogo decide SE a ação inicia
+            // hostilidade contra um NPC combatente presente — nunca o
+            // resultado do combate em si (ver Change-Sistema-de-Combate).
+            let combatentes = combate::npcs_combatentes(&npcs)
+                .into_iter()
+                .filter(|n| n.location_id == player.location_id)
+                .collect::<Vec<_>>();
+            if !combatentes.is_empty() {
+                if let Some(alvo_id) = mestre::avaliar_inicio_combate(&app.llm, &acao.response, &combatentes).await {
+                    let seed = rand::random::<u64>();
+                    match combate::iniciar(&app.pool, &player_id, &alvo_id, seed).await {
+                        Ok(_) => {
+                            tracing::info!(turno, npc_id = %alvo_id, "combate iniciado");
+                            eventos.push(Event::new(
+                                EventType::CombateIniciado,
+                                "orquestrador",
+                                turno,
+                                serde_json::json!({ "npc_id": alvo_id }),
+                            ));
+                        }
+                        Err(err) => tracing::error!(%err, "falha ao iniciar combate"),
+                    }
+                }
+            }
+
             eventos.push(app.orchestrator.evento_fim_de_turno(turno, &roteados));
             eventos
         }
@@ -267,6 +362,54 @@ async fn processar_turno(
     publicar_lote(&app, &eventos).await;
 
     Json(TurnResult { turno, eventos })
+}
+
+/// Turno dentro de um combate ativo: classifica a ação (atacar/fugir/outro)
+/// via Mestre de Jogo, resolve a rodada de forma determinística
+/// (`combate::resolver_rodada`), persiste jogador/NPC/combate. Substitui
+/// inteiramente o fluxo normal de diálogo/roteamento enquanto o combate durar
+/// (ver Design em Change-Sistema-de-Combate — simplificação deliberada, sem
+/// narração de NPCs de história durante o combate no MVP).
+async fn processar_turno_de_combate(
+    app: &AppState,
+    turno: u64,
+    player_id: &str,
+    player: &mut state::Player,
+    mut combate: state::Combate,
+    acao: &AcaoJogadorPayload,
+) -> Vec<Event> {
+    let mut npc = match db::get_npc(&app.pool, &combate.npc_id).await {
+        Ok(Some(n)) => n,
+        _ => {
+            tracing::error!(npc_id = %combate.npc_id, "npc do combate nao encontrado, encerrando combate");
+            let _ = db::encerrar_combate(&app.pool, player_id).await;
+            return vec![Event::new(
+                EventType::CombateEncerrado,
+                "orquestrador",
+                turno,
+                serde_json::json!({ "motivo": "erro_interno" }),
+            )];
+        }
+    };
+
+    let tipo_acao = mestre::avaliar_acao_combate(&app.llm, &acao.response).await;
+    let seed = rand::random::<u64>();
+    let resultado = combate::resolver_rodada(&mut combate, player, &mut npc, tipo_acao, turno, seed);
+
+    if let Err(err) = db::upsert_npc(&app.pool, &npc).await {
+        tracing::error!(%err, "falha ao persistir npc apos rodada de combate");
+    }
+    if let Err(err) = db::upsert_player(&app.pool, player).await {
+        tracing::error!(%err, "falha ao persistir jogador apos rodada de combate");
+    }
+
+    if resultado.combate_encerrado {
+        let _ = db::encerrar_combate(&app.pool, player_id).await;
+    } else if let Err(err) = db::salvar_combate(&app.pool, &combate).await {
+        tracing::error!(%err, "falha ao persistir estado do combate");
+    }
+
+    resultado.eventos
 }
 
 async fn publicar_lote(app: &AppState, eventos: &[Event]) {

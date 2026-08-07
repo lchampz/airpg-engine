@@ -61,7 +61,7 @@ impl GuardrailSaida {
             }
         }
 
-        "O narrador hesita por um momento, incapaz de descrever o que aconteceu com clareza.".to_string()
+        "*O narrador hesita por um momento, incapaz de descrever o que aconteceu com clareza.*".to_string()
     }
 }
 

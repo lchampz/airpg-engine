@@ -29,7 +29,8 @@ Se nada mudou mecanicamente, responda {"mudancas": []} — a maioria dos turnos 
 Campos permitidos e suas operações:
 - "player.hp" com operacao "somar" e valor um número inteiro (negativo para dano, positivo para cura)
 - "player.inventario" com operacao "adicionar" ou "remover" e valor uma string (nome do item)
-Só proponha uma mudança se o texto deixar EXPLÍCITO que algo foi ganho, perdido, causou dano ou curou. Nunca invente itens ou dano que não foram mencionados."#;
+- "player.location_id" com operacao "definir" e valor uma string curta em snake_case identificando o novo local (ex: "floresta_negra"), só se o jogador CLARAMENTE se deslocou para outro lugar (andou até, viajou para, entrou em)
+Só proponha uma mudança se o texto deixar EXPLÍCITO que algo foi ganho, perdido, causou dano, curou, ou que o jogador se moveu de local. Nunca invente itens, dano ou destinos que não foram mencionados."#;
 
 pub async fn propor_mudancas(llm: &LlmClient, contexto: &str) -> Vec<MudancaProposta> {
     match llm.complete(SYSTEM_PROMPT, contexto).await {
@@ -102,6 +103,24 @@ pub fn aplicar(player: &mut Player, turno: u64, proposta: &MudancaProposta) -> R
                 serde_json::json!({ "campo": "player.inventario", "operacao": "remover", "valor": item }),
             ))
         }
+        ("player.location_id", "definir") => {
+            let destino = proposta
+                .valor
+                .as_str()
+                .ok_or_else(|| "valor de player.location_id nao e uma string".to_string())?
+                .to_string();
+            if destino.trim().is_empty() {
+                return Err("destino vazio, rejeitando".to_string());
+            }
+            let anterior = player.location_id.clone();
+            player.location_id = destino.clone();
+            Ok(Event::new(
+                EventType::MudancaEstado,
+                "orquestrador",
+                turno,
+                serde_json::json!({ "campo": "player.location_id", "operacao": "definir", "valor": destino, "anterior": anterior }),
+            ))
+        }
         (campo, operacao) => Err(format!("campo/operacao fora da whitelist: {campo} / {operacao}")),
     }
 }
@@ -120,6 +139,7 @@ mod tests {
             location_id: "taverna".into(),
             nivel: 1,
             classe: "guerreiro".into(),
+            xp: 0,
         }
     }
 
@@ -161,5 +181,20 @@ mod tests {
         assert!(aplicar(&mut p, 0, &proposta).is_ok());
         assert!(aplicar(&mut p, 0, &proposta).is_err());
         assert_eq!(p.inventario.len(), 2);
+    }
+
+    #[test]
+    fn move_jogador_para_novo_local() {
+        let mut p = jogador();
+        let proposta = MudancaProposta { campo: "player.location_id".into(), operacao: "definir".into(), valor: serde_json::json!("floresta_negra") };
+        assert!(aplicar(&mut p, 0, &proposta).is_ok());
+        assert_eq!(p.location_id, "floresta_negra");
+    }
+
+    #[test]
+    fn rejeita_destino_vazio() {
+        let mut p = jogador();
+        let proposta = MudancaProposta { campo: "player.location_id".into(), operacao: "definir".into(), valor: serde_json::json!("") };
+        assert!(aplicar(&mut p, 0, &proposta).is_err());
     }
 }

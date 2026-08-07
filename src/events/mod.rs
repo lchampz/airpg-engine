@@ -53,6 +53,14 @@ pub enum EventType {
     /// Publicado pelo engine (Rust) de volta ao Mundo Vivo ao fim de uma interação reativa.
     InteracaoFinalizada,
     PedidoEsclarecimento,
+    /// Ver Change-Sistema-de-Combate.
+    CombateIniciado,
+    AtaqueResolvido,
+    CombateEncerrado,
+    /// Ver Change-Fluxo-de-Morte.
+    JogadorMorreu,
+    /// Ver Change-Sistema-de-XP-Progressao.
+    SubiuDeNivel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

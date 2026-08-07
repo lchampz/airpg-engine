@@ -1,7 +1,8 @@
+use crate::combate::TipoAcaoCombate;
 use crate::db;
 use crate::jsonutil::extrair_json;
 use crate::llm::LlmClient;
-use crate::state::Cena;
+use crate::state::{Cena, Npc};
 use serde::Deserialize;
 use sqlx::sqlite::SqlitePool;
 
@@ -104,5 +105,66 @@ pub async fn avaliar_verificacao(llm: &LlmClient, acao: &str) -> VerificacaoTest
             descricao: p.descricao,
         },
         _ => VerificacaoTeste { precisa_teste: false, atributo: String::new(), dificuldade: 0, descricao: String::new() },
+    }
+}
+
+const SYSTEM_PROMPT_INICIO_COMBATE: &str = r#"Você é o Mestre de Jogo de um RPG de fantasia medieval. Existem criaturas hostis presentes na cena. Decida se a ação do jogador inicia combate contra uma delas.
+Responda APENAS com um JSON no formato {"inicia_combate": bool, "alvo_id": "id da criatura ou vazio"}.
+Só inicie combate se o jogador claramente ataca, ameaça fisicamente, ou é atacado primeiro. Conversa, negociação ou observação NÃO inicia combate."#;
+
+#[derive(Debug, Deserialize)]
+struct InicioCombateProposto {
+    inicia_combate: bool,
+    #[serde(default)]
+    alvo_id: String,
+}
+
+/// Decide se a ação do turno inicia combate contra um dos NPCs combatentes
+/// presentes — nunca decide o resultado do combate em si (isso é sempre
+/// `combate::resolver_rodada`, determinístico). Só considera `alvo_id` que de
+/// fato está na lista de combatentes recebida — não confia cegamente no que o
+/// LLM devolve.
+pub async fn avaliar_inicio_combate(llm: &LlmClient, acao: &str, combatentes: &[&Npc]) -> Option<String> {
+    if combatentes.is_empty() {
+        return None;
+    }
+
+    let lista = combatentes.iter().map(|n| format!("{} (id: {})", n.nome, n.id)).collect::<Vec<_>>().join(", ");
+    let entrada = format!("Criaturas hostis presentes: {lista}\nAção do jogador: {acao}");
+
+    let proposta = match llm.complete(SYSTEM_PROMPT_INICIO_COMBATE, &entrada).await {
+        Ok(resposta) => extrair_json::<InicioCombateProposto>(&resposta),
+        Err(err) => {
+            tracing::error!(%err, "falha ao consultar o Mestre de Jogo para decidir inicio de combate");
+            None
+        }
+    };
+
+    proposta
+        .filter(|p| p.inicia_combate)
+        .and_then(|p| combatentes.iter().find(|n| n.id == p.alvo_id).map(|n| n.id.clone()))
+}
+
+const SYSTEM_PROMPT_ACAO_COMBATE: &str = r#"Você é o Mestre de Jogo de um RPG de fantasia medieval. O jogador está em combate. Classifique a ação dele.
+Responda APENAS com um JSON no formato {"tipo": "atacar" | "fugir" | "outro"}."#;
+
+#[derive(Debug, Deserialize)]
+struct AcaoCombateProposta {
+    tipo: String,
+}
+
+/// Classifica a ação do jogador dentro de um combate já em andamento — o
+/// resultado mecânico (acerto/dano) continua sempre em `combate::resolver_rodada`.
+pub async fn avaliar_acao_combate(llm: &LlmClient, acao: &str) -> TipoAcaoCombate {
+    match llm.complete(SYSTEM_PROMPT_ACAO_COMBATE, acao).await {
+        Ok(resposta) => match extrair_json::<AcaoCombateProposta>(&resposta) {
+            Some(p) if p.tipo == "atacar" => TipoAcaoCombate::Atacar,
+            Some(p) if p.tipo == "fugir" => TipoAcaoCombate::Fugir,
+            _ => TipoAcaoCombate::Outro,
+        },
+        Err(err) => {
+            tracing::error!(%err, "falha ao classificar acao de combate, tratando como ataque");
+            TipoAcaoCombate::Atacar
+        }
     }
 }

@@ -1,4 +1,4 @@
-use crate::state::{Cena, MemoriaNpc, Npc, Player};
+use crate::state::{Cena, Combate, MemoriaNpc, Npc, Player};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
 /// Estado Rígido persiste em SQLite no MVP (ver Stack-Escolhida / Estado-Rigido).
@@ -64,6 +64,18 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Um combate ativo por jogador (ver Change-Sistema-de-Combate — 1v1 no MVP).
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS combates (
+            player_id TEXT PRIMARY KEY,
+            data TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     seed_se_vazio(&pool).await?;
 
     Ok(pool)
@@ -98,6 +110,14 @@ async fn migrar_npc_memoria(pool: &SqlitePool) -> anyhow::Result<()> {
 async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM npcs").fetch_one(pool).await?;
     if count.0 > 0 {
+        // Tabela já populada de uma sessão anterior — ainda assim garante que
+        // o combatente de exemplo exista, já que ele foi adicionado ao seed
+        // depois que muitos volumes de dev já tinham sido criados (ver
+        // Change-Sistema-de-Combate). Sem isso, testar combate exigiria
+        // apagar o volume manualmente.
+        if get_npc(pool, "npc_lobo_floresta").await?.is_none() {
+            upsert_npc(pool, &npc_lobo_seed()).await?;
+        }
         return Ok(());
     }
 
@@ -111,6 +131,11 @@ async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
             atitude_com_jogador: "neutro".into(),
             location_id: "taverna_porto_velho".into(),
             autonomo: true,
+            hp: None,
+            classe_armadura: None,
+            dano_dado_faces: None,
+            xp_recompensa: None,
+            loot: vec![],
         },
         Npc {
             id: "npc_cliente_gerta".into(),
@@ -119,6 +144,11 @@ async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
             atitude_com_jogador: "neutro".into(),
             location_id: "taverna_porto_velho".into(),
             autonomo: false,
+            hp: None,
+            classe_armadura: None,
+            dano_dado_faces: None,
+            xp_recompensa: None,
+            loot: vec![],
         },
         Npc {
             id: "npc_guarda_holt".into(),
@@ -127,13 +157,37 @@ async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
             atitude_com_jogador: "desconfiado".into(),
             location_id: "floresta_negra".into(),
             autonomo: true,
+            hp: None,
+            classe_armadura: None,
+            dano_dado_faces: None,
+            xp_recompensa: None,
+            loot: vec![],
         },
+        npc_lobo_seed(),
     ];
     for npc in &npcs {
         upsert_npc(pool, npc).await?;
     }
 
     Ok(())
+}
+
+/// Combatente de exemplo, para testar o sistema de combate (ver
+/// Change-Sistema-de-Combate) sem depender de criação de conteúdo.
+fn npc_lobo_seed() -> Npc {
+    Npc {
+        id: "npc_lobo_floresta".into(),
+        nome: "Lobo Selvagem".into(),
+        status: crate::state::NpcStatus::Hostil,
+        atitude_com_jogador: "hostil".into(),
+        location_id: "floresta_negra".into(),
+        autonomo: false,
+        hp: Some(crate::state::Hp { atual: 12, maximo: 12 }),
+        classe_armadura: Some(12),
+        dano_dado_faces: Some(4),
+        xp_recompensa: Some(50),
+        loot: vec!["presa_de_lobo".into()],
+    }
 }
 
 pub async fn upsert_player(pool: &SqlitePool, player: &Player) -> anyhow::Result<()> {
@@ -273,6 +327,71 @@ pub async fn upsert_cena(pool: &SqlitePool, cena: &Cena) -> anyhow::Result<()> {
     .bind(fatos)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Máximo de fatos por Cena — a simulação de mundo em background (ver
+/// Change-Simulacao-Mundo-Background) roda indefinidamente, então a lista
+/// precisa de um teto para não crescer sem limite. Os mais antigos saem.
+pub const MAX_FATOS_POR_CENA: usize = 20;
+
+/// Adiciona um fato a uma Cena já existente — usado pela simulação de mundo
+/// em background do Mundo Vivo (Elixir). Só adiciona a cenas que já existem
+/// (não cria uma nova aqui — criação é sempre via `mestre::resolver_cena`).
+pub async fn adicionar_fato_a_cena(pool: &SqlitePool, location_id: &str, fato: &str) -> anyhow::Result<bool> {
+    let Some(mut cena) = get_cena(pool, location_id).await? else {
+        return Ok(false);
+    };
+
+    cena.fatos_estabelecidos.push(fato.to_string());
+    if cena.fatos_estabelecidos.len() > MAX_FATOS_POR_CENA {
+        let excesso = cena.fatos_estabelecidos.len() - MAX_FATOS_POR_CENA;
+        cena.fatos_estabelecidos.drain(0..excesso);
+    }
+    upsert_cena(pool, &cena).await?;
+    Ok(true)
+}
+
+pub async fn get_combate(pool: &SqlitePool, player_id: &str) -> anyhow::Result<Option<Combate>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT data FROM combates WHERE player_id = ?")
+        .bind(player_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(data,)| serde_json::from_str(&data)).transpose()?)
+}
+
+pub async fn salvar_combate(pool: &SqlitePool, combate: &Combate) -> anyhow::Result<()> {
+    let data = serde_json::to_string(combate)?;
+    sqlx::query("INSERT INTO combates (player_id, data) VALUES (?, ?) ON CONFLICT(player_id) DO UPDATE SET data = excluded.data")
+        .bind(&combate.player_id)
+        .bind(data)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn encerrar_combate(pool: &SqlitePool, player_id: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM combates WHERE player_id = ?").bind(player_id).execute(pool).await?;
+    Ok(())
+}
+
+/// Ver Change-Fluxo-de-Morte — apaga só o que pertence a este jogador
+/// especificamente. `npcs`/`cenas` (dados de mundo, compartilhados) não são
+/// tocados.
+pub async fn reiniciar_dados_do_jogador(pool: &SqlitePool, player_id: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM players WHERE id = ?").bind(player_id).execute(pool).await?;
+    sqlx::query("DELETE FROM npc_memoria WHERE player_id = ?").bind(player_id).execute(pool).await?;
+    sqlx::query("DELETE FROM combates WHERE player_id = ?").bind(player_id).execute(pool).await?;
+    Ok(())
+}
+
+/// Ver Change-Fluxo-de-Morte — destrutivo para TODOS os jogadores da
+/// instância, não só quem pediu o reinício. Apaga tudo e roda o seed de novo.
+pub async fn reiniciar_mundo(pool: &SqlitePool) -> anyhow::Result<()> {
+    for tabela in ["players", "npcs", "npc_memoria", "cenas", "combates"] {
+        sqlx::query(&format!("DELETE FROM {tabela}")).execute(pool).await?;
+    }
+    seed_se_vazio(pool).await?;
     Ok(())
 }
 

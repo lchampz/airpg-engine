@@ -28,7 +28,7 @@ impl Orchestrator {
     /// MAX_AGENTES_POR_TURNO por turno (ver Decisoes-Resolvidas).
     pub fn rotear_agentes<'a>(&self, player: &Player, npcs: &'a [Npc]) -> Vec<&'a Npc> {
         npcs.iter()
-            .filter(|npc| npc.location_id == player.location_id)
+            .filter(|npc| npc.location_id == player.location_id && npc.status != crate::state::NpcStatus::Morto)
             .take(MAX_AGENTES_POR_TURNO)
             .collect()
     }
@@ -61,6 +61,7 @@ mod tests {
             location_id: "taverna".into(),
             nivel: 1,
             classe: "guerreiro".into(),
+            xp: 0,
         }
     }
 
@@ -84,6 +85,11 @@ mod tests {
                 atitude_com_jogador: "neutro".into(),
                 location_id: if i % 2 == 0 { "taverna".into() } else { "floresta".into() },
                 autonomo: false,
+                hp: None,
+                classe_armadura: None,
+                dano_dado_faces: None,
+                xp_recompensa: None,
+                loot: vec![],
             })
             .collect();
         let roteados = orch.rotear_agentes(&p, &npcs);

@@ -14,16 +14,19 @@ pub struct ResultadoDados {
     pub sucesso: bool,
 }
 
+/// Rolagem genérica de um dado de N faces — base para `skill_dados` (teste
+/// contra dificuldade) e para iniciativa/dano em combate (ver
+/// Change-Sistema-de-Combate), que não têm o conceito de "sucesso/fracasso"
+/// contra uma DC, só um valor.
+pub fn skill_rolar_dado(faces: u32, seed: u64) -> u32 {
+    // Gerador determinístico simples (LCG) para manter a skill previsível/testável.
+    // Em produção o seed vem de `rand::random()` (aleatoriedade real), não fixo.
+    ((seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) % faces as u64 + 1) as u32
+}
+
 pub fn skill_dados(dificuldade: u32, seed: u64) -> ResultadoDados {
-    // Gerador determinístico simples (LCG) para manter a skill previsível/testável;
-    // trocar por uma fonte de aleatoriedade real antes de produção.
-    let rolagem = ((seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) % 20 + 1) as u32;
-    ResultadoDados {
-        schema_version: SKILL_DADOS_VERSION,
-        rolagem,
-        dificuldade,
-        sucesso: rolagem >= dificuldade,
-    }
+    let rolagem = skill_rolar_dado(20, seed);
+    ResultadoDados { schema_version: SKILL_DADOS_VERSION, rolagem, dificuldade, sucesso: rolagem >= dificuldade }
 }
 
 #[cfg(test)]
@@ -35,6 +38,14 @@ mod tests {
         for seed in 0..1000 {
             let r = skill_dados(10, seed);
             assert!(r.rolagem >= 1 && r.rolagem <= 20);
+        }
+    }
+
+    #[test]
+    fn rolar_dado_generico_respeita_faces() {
+        for seed in 0..1000 {
+            let r = skill_rolar_dado(6, seed);
+            assert!(r >= 1 && r <= 6);
         }
     }
 }

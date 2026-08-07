@@ -11,6 +11,20 @@ pub struct Player {
     pub location_id: String,
     pub nivel: u32,
     pub classe: String,
+    /// Ver Change-Sistema-de-XP-Progressao. Nível é sempre derivado de xp via
+    /// `nivel_por_xp` — nunca setado diretamente pelo LLM.
+    #[serde(default)]
+    pub xp: u32,
+}
+
+/// Limiares de XP por nível (índice = nível - 1). Constante no código, não no
+/// banco — ver Change-Sistema-de-XP-Progressao.
+pub const LIMIARES_XP: &[u32] = &[0, 100, 250, 450, 700, 1000, 1400, 1900, 2500, 3200];
+/// Classe de armadura padrão do jogador sem equipamento (ver Change-Sistema-de-Combate).
+pub const PLAYER_CA_PADRAO: u32 = 10;
+
+pub fn nivel_por_xp(xp: u32) -> u32 {
+    LIMIARES_XP.iter().filter(|&&limiar| xp >= limiar).count() as u32
 }
 
 impl Player {
@@ -26,6 +40,7 @@ impl Player {
             location_id: "taverna_porto_velho".into(),
             nivel: 1,
             classe: "guerreiro".into(),
+            xp: 0,
         }
     }
 }
@@ -44,6 +59,20 @@ pub struct Npc {
     pub atitude_com_jogador: String,
     pub location_id: String,
     pub autonomo: bool,
+    /// `None` = NPC não combatente (ex: Bram, o taverneiro). Só criaturas
+    /// hostis/monstros preenchem os campos de combate abaixo — ver
+    /// Change-Sistema-de-Combate.
+    #[serde(default)]
+    pub hp: Option<Hp>,
+    #[serde(default)]
+    pub classe_armadura: Option<u32>,
+    /// Faces do dado de dano do ataque básico (ex: 6 = 1d6).
+    #[serde(default)]
+    pub dano_dado_faces: Option<u32>,
+    #[serde(default)]
+    pub xp_recompensa: Option<u32>,
+    #[serde(default)]
+    pub loot: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -102,6 +131,21 @@ pub struct EstadoEmocional {
     pub lente_perceptiva: String,
     #[serde(default)]
     pub motivacao_imediata: String,
+}
+
+/// Um combate ativo — jogador contra um único NPC hostil por vez no MVP (ver
+/// Change-Sistema-de-Combate; múltiplos combatentes simultâneos ficaram fora
+/// do escopo inicial de propósito). Persistido por `player_id`: um jogador só
+/// pode estar em um combate por vez.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Combate {
+    pub player_id: String,
+    pub npc_id: String,
+    pub rodada: u32,
+    /// true = vez do jogador agir; false = o NPC já agiu nesta rodada e o
+    /// resultado foi resolvido no mesmo turno (não há espera de input do NPC,
+    /// ele reage no mesmo /turn — ver Design em Change-Sistema-de-Combate).
+    pub ativo: bool,
 }
 
 /// Memória de curto/médio prazo de um NPC em relação a um jogador específico
