@@ -269,6 +269,7 @@ async fn processar_turno(
                 turno,
                 serde_json::json!({ "motivo": "rate_limit", "detalhe": "muitos turnos em pouco tempo, aguarde um momento" }),
             )],
+            presentes: vec![],
         });
     }
 
