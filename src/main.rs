@@ -386,6 +386,22 @@ async fn processar_turno(
     let turno = app.turno.fetch_add(1, Ordering::SeqCst);
     let player_id = player_id_de(&headers);
 
+    // Livre-Arbítrio: a cada 5 turnos globais (não por jogador — múltiplos
+    // jogadores compartilham o mesmo contador `app.turno`), dispara um tick
+    // de ação autônoma de NPC em segundo plano. Fire-and-forget, nunca
+    // atrasa a resposta deste turno — ver Módulos 2+3+6 em Tarefas-Pendentes.
+    // Fica ANTES do rate limit de propósito: é o "relógio do mundo", não
+    // deveria parar de bater só porque um jogador específico estourou o
+    // próprio limite pessoal de turnos.
+    if turno % 5 == 0 {
+        let pool_tick = app.pool.clone();
+        let llm_mundo = app.llm_perfil("mundo").await;
+        let guardrail_tick = app.guardrail_saida.clone();
+        tokio::spawn(async move {
+            livre_arbitrio::tick(pool_tick, llm_mundo, guardrail_tick, turno).await;
+        });
+    }
+
     if !dentro_do_limite_de_turnos(&app, &player_id) {
         return Json(TurnResult {
             turno,
@@ -396,19 +412,6 @@ async fn processar_turno(
                 serde_json::json!({ "motivo": "rate_limit", "detalhe": "muitos turnos em pouco tempo, aguarde um momento" }),
             )],
             presentes: vec![],
-        });
-    }
-
-    // Livre-Arbítrio: a cada 5 turnos globais (não por jogador — múltiplos
-    // jogadores compartilham o mesmo contador `app.turno`), dispara um tick
-    // de ação autônoma de NPC em segundo plano. Fire-and-forget, nunca
-    // atrasa a resposta deste turno — ver Módulos 2+3+6 em Tarefas-Pendentes.
-    if turno % 5 == 0 {
-        let pool_tick = app.pool.clone();
-        let llm_mundo = app.llm_perfil("mundo").await;
-        let guardrail_tick = app.guardrail_saida.clone();
-        tokio::spawn(async move {
-            livre_arbitrio::tick(pool_tick, llm_mundo, guardrail_tick, turno).await;
         });
     }
 
