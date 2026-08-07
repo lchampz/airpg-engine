@@ -2,9 +2,11 @@ use crate::consolidacao;
 use crate::db;
 use crate::guardrail::GuardrailSaida;
 use crate::llm::LlmClient;
+use crate::rag::RagIndex;
 use crate::skills::ResultadoDados;
 use crate::state::{Cena, MemoriaNpc, Npc};
 use sqlx::sqlite::SqlitePool;
+use std::sync::Arc;
 
 /// Ponto único de interação de um agente reativo com um jogador: carrega a
 /// memória do par (NPC, jogador), monta o prompt com a Cena (fatos do Mestre
@@ -22,15 +24,31 @@ pub async fn processar_interacao(
     cena: &Cena,
     resultado_dados: Option<&ResultadoDados>,
     entrada: &str,
+    rag: Option<&Arc<RagIndex>>,
 ) -> String {
-    let mut memoria = db::get_memoria(pool, &npc.id, player_id).await.unwrap_or_default();
+    let mut memoria = db::get_memoria(pool, &npc.id, player_id)
+        .await
+        .unwrap_or_default();
 
-    let texto = dialogar(pool, llm, guardrail, npc, cena, &memoria, resultado_dados, entrada).await;
+    let texto = dialogar(
+        pool,
+        llm,
+        guardrail,
+        npc,
+        cena,
+        &memoria,
+        resultado_dados,
+        entrada,
+        rag,
+    )
+    .await;
 
     db::registrar_troca(&mut memoria, entrada.to_string(), texto.clone());
 
     if memoria.turnos_desde_consolidacao >= db::TURNOS_POR_CONSOLIDACAO {
-        if let Some(resultado) = consolidacao::consolidar(llm, &npc.nome, &memoria.resumo, &memoria.ctx).await {
+        if let Some(resultado) =
+            consolidacao::consolidar(llm, &npc.nome, &memoria.resumo, &memoria.ctx).await
+        {
             memoria.resumo = resultado.resumo;
             memoria.estado_emocional = resultado.estado_emocional;
             memoria.turnos_desde_consolidacao = 0;
@@ -53,8 +71,20 @@ async fn dialogar(
     memoria: &MemoriaNpc,
     resultado_dados: Option<&ResultadoDados>,
     entrada: &str,
+    rag: Option<&Arc<RagIndex>>,
 ) -> String {
-    let texto = gerar_e_revisar(llm, guardrail, npc, cena, memoria, resultado_dados, entrada, None).await;
+    let texto = gerar_e_revisar(
+        llm,
+        guardrail,
+        npc,
+        cena,
+        memoria,
+        resultado_dados,
+        entrada,
+        None,
+        rag,
+    )
+    .await;
 
     // Anti-repetição (ver Change-Economia-Viva-e-Consistencia): NPCs
     // diferentes (ou o mesmo NPC em sessões diferentes) tendiam a abrir com
@@ -63,7 +93,18 @@ async fn dialogar(
     let texto = match db::frase_repetida(pool, &npc.location_id, &texto).await {
         Ok(Some(frase_antiga)) => {
             tracing::info!(npc = %npc.id, "reacoes: fala colidiu com frase recente, pedindo nova geracao");
-            gerar_e_revisar(llm, guardrail, npc, cena, memoria, resultado_dados, entrada, Some(&frase_antiga)).await
+            gerar_e_revisar(
+                llm,
+                guardrail,
+                npc,
+                cena,
+                memoria,
+                resultado_dados,
+                entrada,
+                Some(&frase_antiga),
+                rag,
+            )
+            .await
         }
         _ => texto,
     };
@@ -84,10 +125,25 @@ async fn gerar_e_revisar(
     resultado_dados: Option<&ResultadoDados>,
     entrada: &str,
     evitar_frase: Option<&str>,
+    rag: Option<&Arc<RagIndex>>,
 ) -> String {
-    let system = montar_system_prompt(npc, cena, memoria, resultado_dados, evitar_frase);
+    let regras_relevantes = match rag {
+        Some(indice) => indice.buscar_relevantes(entrada, 2).await,
+        None => vec![],
+    };
+    let system = montar_system_prompt(
+        npc,
+        cena,
+        memoria,
+        resultado_dados,
+        evitar_frase,
+        &regras_relevantes,
+    );
 
-    let bruto = match llm.complete_with_history(&system, &memoria.ctx, entrada).await {
+    let bruto = match llm
+        .complete_with_history(&system, &memoria.ctx, entrada)
+        .await
+    {
         Ok(texto) => texto,
         Err(err) => {
             tracing::error!(%err, npc = %npc.id, "falha ao chamar o LLM para dialogo do agente");
@@ -109,7 +165,14 @@ async fn gerar_e_revisar(
     guardrail.revisar(&bruto, resultado_dados).await
 }
 
-fn montar_system_prompt(npc: &Npc, cena: &Cena, memoria: &MemoriaNpc, resultado_dados: Option<&ResultadoDados>, evitar_frase: Option<&str>) -> String {
+fn montar_system_prompt(
+    npc: &Npc,
+    cena: &Cena,
+    memoria: &MemoriaNpc,
+    resultado_dados: Option<&ResultadoDados>,
+    evitar_frase: Option<&str>,
+    regras_relevantes: &[crate::rag::RegraChunk],
+) -> String {
     let mut partes = vec![format!(
         "Você é {}, um NPC num RPG de fantasia medieval. Sua atitude de base com o jogador é: {}.{}",
         npc.nome,
@@ -173,6 +236,19 @@ fn montar_system_prompt(npc: &Npc, cena: &Cena, memoria: &MemoriaNpc, resultado_
     if let Some(frase) = evitar_frase {
         partes.push(format!(
             "IMPORTANTE: você (ou outro personagem por aqui) já disse algo muito parecido com isto recentemente — não repita: \"{frase}\". Responda de um jeito genuinamente diferente."
+        ));
+    }
+
+    // RAG sobre o SRD (ver Change-RAG-SRD-e-Desktop): texto de regra real
+    // pra fundamentar menções a magia/condição/combate, quando a ação do
+    // jogador for relevante o bastante pra recuperar algo (busca por
+    // similaridade — se nada bate, a lista vem vazia e esta seção nem entra
+    // no prompt). Nunca deve ser lido ao jogador literalmente; é referência
+    // pro NPC narrar com precisão, não um texto pra recitar.
+    let contexto_regras = crate::rag::formatar_para_prompt(regras_relevantes);
+    if !contexto_regras.is_empty() {
+        partes.push(format!(
+            "Regras do sistema potencialmente relevantes pra esta cena (use como referência factual, NÃO leia ao jogador literalmente):\n{contexto_regras}"
         ));
     }
 

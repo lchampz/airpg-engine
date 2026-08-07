@@ -179,6 +179,25 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // RAG sobre o SRD 5.1 (ver Change-RAG-SRD-e-Desktop no vault). Populada
+    // offline via `cargo run --bin ingest_srd -- --fetch` contra este mesmo
+    // DATABASE_URL — o engine nunca escreve aqui, só lê (rag::carregar).
+    // Tabela vazia é um estado válido: RAG fica desativado, sem erro.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS regras_srd_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            categoria TEXT NOT NULL,
+            titulo TEXT NOT NULL,
+            texto TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     seed_configuracoes_llm_se_vazio(&pool).await?;
     seed_se_vazio(&pool).await?;
 

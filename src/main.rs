@@ -9,6 +9,7 @@ mod llm;
 mod mestre;
 mod orchestrator;
 mod personagens;
+mod rag;
 mod reacoes;
 mod skills;
 mod state;
@@ -28,7 +29,10 @@ use orchestrator::Orchestrator;
 use serde::Deserialize;
 use sqlx::sqlite::SqlitePool;
 use std::collections::HashMap;
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -53,6 +57,11 @@ struct AppState {
     nats: Option<async_nats::Client>,
     turno: Arc<AtomicU64>,
     rate_limit: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    /// RAG sobre o SRD 5.1 (ver Change-RAG-SRD-e-Desktop) — `None` se a
+    /// tabela `regras_srd_chunks` estiver vazia (não populada via
+    /// `ingest_srd`). Opcional por design: o engine funciona sem isso,
+    /// só narra sem o contexto de regra extra no prompt.
+    rag: Option<Arc<rag::RagIndex>>,
 }
 
 impl AppState {
@@ -84,8 +93,20 @@ struct TurnResult {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://airpg.db?mode=rwc".into());
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://airpg.db?mode=rwc".into());
     let pool = db::init_pool(&database_url).await?;
+
+    // RAG (ver Change-RAG-SRD-e-Desktop): melhor-esforço — se a inicialização
+    // falhar (ex: modelo de embedding não baixa por falta de rede na
+    // primeira execução), o engine sobe do mesmo jeito, só sem RAG.
+    let rag_index = match rag::carregar(&pool).await {
+        Ok(indice) => indice.map(Arc::new),
+        Err(err) => {
+            tracing::warn!(%err, "rag: falha ao carregar indice, seguindo sem RAG");
+            None
+        }
+    };
 
     let llm = LlmClient::from_env();
 
@@ -109,13 +130,17 @@ async fn main() -> anyhow::Result<()> {
         nats: nats.clone(),
         turno: Arc::new(AtomicU64::new(0)),
         rate_limit: Arc::new(Mutex::new(HashMap::new())),
+        rag: rag_index,
     };
 
     if let Some(client) = &nats {
         spawn_subscriber(client.clone(), state.clone());
     }
 
-    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     let app = Router::new()
         .route("/health", get(health))
@@ -128,7 +153,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/historico", get(obter_historico))
         .route("/cenas/:location_id/fatos", post(adicionar_fato_a_cena))
         .route("/admin/llm-perfis", get(listar_llm_perfis))
-        .route("/admin/llm-perfis/:perfil", axum::routing::put(atualizar_llm_perfil))
+        .route(
+            "/admin/llm-perfis/:perfil",
+            axum::routing::put(atualizar_llm_perfil),
+        )
         .route("/log-global", get(obter_log_global))
         .route("/admin/gerar-personagem", post(gerar_personagem_admin))
         .layer(cors)
@@ -179,9 +207,15 @@ fn dentro_do_limite_de_turnos(app: &AppState, player_id: &str) -> bool {
     }
 }
 
-async fn obter_player(State(app): State<AppState>, headers: HeaderMap, Query(q): Query<PlayerIdQuery>) -> Json<state::Player> {
+async fn obter_player(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<PlayerIdQuery>,
+) -> Json<state::Player> {
     let player_id = q.player_id.unwrap_or_else(|| player_id_de(&headers));
-    let player = db::get_ou_criar_player(&app.pool, &player_id).await.unwrap_or_else(|_| state::Player::seed(player_id));
+    let player = db::get_ou_criar_player(&app.pool, &player_id)
+        .await
+        .unwrap_or_else(|_| state::Player::seed(player_id));
     Json(player)
 }
 
@@ -190,22 +224,37 @@ struct ListarNpcsQuery {
     descobertos_por: Option<String>,
 }
 
-async fn listar_npcs(State(app): State<AppState>, Query(q): Query<ListarNpcsQuery>) -> Json<Vec<state::Npc>> {
+async fn listar_npcs(
+    State(app): State<AppState>,
+    Query(q): Query<ListarNpcsQuery>,
+) -> Json<Vec<state::Npc>> {
     let npcs = db::list_npcs(&app.pool).await.unwrap_or_default();
     match q.descobertos_por {
         Some(player_id) => {
-            let descobertos = db::npcs_descobertos_por(&app.pool, &player_id).await.unwrap_or_default();
-            Json(npcs.into_iter().filter(|npc| descobertos.contains(&npc.id)).collect())
+            let descobertos = db::npcs_descobertos_por(&app.pool, &player_id)
+                .await
+                .unwrap_or_default();
+            Json(
+                npcs.into_iter()
+                    .filter(|npc| descobertos.contains(&npc.id))
+                    .collect(),
+            )
         }
         None => Json(npcs),
     }
 }
 
-async fn obter_npc(State(app): State<AppState>, Path(id): Path<String>) -> Json<Option<state::Npc>> {
+async fn obter_npc(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<Option<state::Npc>> {
     Json(db::get_npc(&app.pool, &id).await.unwrap_or(None))
 }
 
-async fn obter_combate(State(app): State<AppState>, headers: HeaderMap) -> Json<Option<state::Combate>> {
+async fn obter_combate(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Option<state::Combate>> {
     let player_id = player_id_de(&headers);
     Json(db::get_combate(&app.pool, &player_id).await.unwrap_or(None))
 }
@@ -214,7 +263,11 @@ async fn obter_combate(State(app): State<AppState>, headers: HeaderMap) -> Json<
 /// reconstruir o chat ao recarregar a página. Últimos 100 eventos.
 async fn obter_historico(State(app): State<AppState>, headers: HeaderMap) -> Json<Vec<Event>> {
     let player_id = player_id_de(&headers);
-    Json(db::historico_do_jogador(&app.pool, &player_id, 100).await.unwrap_or_default())
+    Json(
+        db::historico_do_jogador(&app.pool, &player_id, 100)
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 /// Ver Estrategia-Custo-Tokens no vault: perfis de modelo por sensibilidade
@@ -230,7 +283,9 @@ struct LlmPerfilResposta {
 }
 
 async fn listar_llm_perfis(State(app): State<AppState>) -> Json<Vec<LlmPerfilResposta>> {
-    let cfgs = db::list_configuracoes_llm(&app.pool).await.unwrap_or_default();
+    let cfgs = db::list_configuracoes_llm(&app.pool)
+        .await
+        .unwrap_or_default();
     Json(
         cfgs.into_iter()
             .map(|c| LlmPerfilResposta {
@@ -266,14 +321,22 @@ async fn atualizar_llm_perfil(
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let atual = db::get_configuracao_llm(&app.pool, &perfil).await.ok().flatten();
+    let atual = db::get_configuracao_llm(&app.pool, &perfil)
+        .await
+        .ok()
+        .flatten();
     let api_key = match payload.api_key {
         Some(ref k) if k.is_empty() => None,
         Some(k) => Some(k),
         None => atual.and_then(|c| c.api_key),
     };
 
-    let cfg = db::ConfiguracaoLlm { perfil: perfil.clone(), model: payload.model, api_base: payload.api_base, api_key };
+    let cfg = db::ConfiguracaoLlm {
+        perfil: perfil.clone(),
+        model: payload.model,
+        api_base: payload.api_base,
+        api_key,
+    };
     if let Err(err) = db::set_configuracao_llm(&app.pool, &cfg).await {
         tracing::error!(%err, %perfil, "falha ao salvar configuracao de llm");
         return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -295,9 +358,16 @@ struct LogGlobalQuery {
 
 /// Ver Módulo 4 em Tarefas-Pendentes no vault: livro-caixa de todo o mundo,
 /// não só do jogador que chama.
-async fn obter_log_global(State(app): State<AppState>, Query(q): Query<LogGlobalQuery>) -> Json<Vec<db::AcaoGlobal>> {
+async fn obter_log_global(
+    State(app): State<AppState>,
+    Query(q): Query<LogGlobalQuery>,
+) -> Json<Vec<db::AcaoGlobal>> {
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
-    Json(db::listar_acoes_globais(&app.pool, q.location_id.as_deref(), limit).await.unwrap_or_default())
+    Json(
+        db::listar_acoes_globais(&app.pool, q.location_id.as_deref(), limit)
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -317,7 +387,15 @@ async fn gerar_personagem_admin(
     let llm = app.llm_perfil("personagens").await;
     let turno_global = app.turno.load(Ordering::SeqCst) as i64;
 
-    match personagens::gerar_e_registrar_personagem(&app.pool, &llm, turno_global, &payload.location_id, &payload.contexto).await {
+    match personagens::gerar_e_registrar_personagem(
+        &app.pool,
+        &llm,
+        turno_global,
+        &payload.location_id,
+        &payload.contexto,
+    )
+    .await
+    {
         Some(npc) => Ok(Json(npc)),
         None => Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY),
     }
@@ -356,7 +434,11 @@ struct ReiniciarPayload {
 /// apaga tudo — é destrutivo para QUALQUER jogador na mesma instância, não só
 /// quem morreu (decisão de produto em aberto se isso deveria existir em
 /// produção multiusuário, ver o change).
-async fn reiniciar_jogador(State(app): State<AppState>, headers: HeaderMap, Json(payload): Json<ReiniciarPayload>) -> Json<state::Player> {
+async fn reiniciar_jogador(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ReiniciarPayload>,
+) -> Json<state::Player> {
     let player_id = player_id_de(&headers);
 
     if payload.escopo == "mundo" {
@@ -435,7 +517,15 @@ async fn processar_turno(
             serde_json::to_value(&rejeicao).unwrap(),
         )],
         Ok(()) if combate_ativo.is_some() => {
-            processar_turno_de_combate(&app, turno, &player_id, &mut player, combate_ativo.unwrap(), &acao).await
+            processar_turno_de_combate(
+                &app,
+                turno,
+                &player_id,
+                &mut player,
+                combate_ativo.unwrap(),
+                &acao,
+            )
+            .await
         }
         Ok(()) => {
             let cena = mestre::resolver_cena(&app.pool, &app.llm, &player.location_id).await;
@@ -445,7 +535,8 @@ async fn processar_turno(
             // sempre a rolagem determinística de `skills::skill_dados`, nunca
             // texto gerado (ver Subagentes-e-Skills). O resultado numérico
             // vira restrição obrigatória para toda narração deste turno.
-            let verificacao = mestre::avaliar_verificacao(&app.llm, &acao.response).await;
+            let verificacao =
+                mestre::avaliar_verificacao(&app.llm, &acao.response, app.rag.as_ref()).await;
             let resultado_dados = if verificacao.precisa_teste {
                 let seed = rand::random::<u64>();
                 let resultado = skills::skill_dados(verificacao.dificuldade, seed);
@@ -472,8 +563,13 @@ async fn processar_turno(
             // isso, todo NPC roteado respondia à mesma fala do jogador,
             // mesmo quando só um deles fazia sentido (ex: preço de bebida
             // respondido por dois NPCs com valores contraditórios).
-            let destinatarios_ids = mestre::avaliar_destinatarios(&app.llm, &acao.response, &roteados).await;
-            let destinatarios: Vec<&state::Npc> = roteados.iter().filter(|n| destinatarios_ids.contains(&n.id)).copied().collect();
+            let destinatarios_ids =
+                mestre::avaliar_destinatarios(&app.llm, &acao.response, &roteados).await;
+            let destinatarios: Vec<&state::Npc> = roteados
+                .iter()
+                .filter(|n| destinatarios_ids.contains(&n.id))
+                .copied()
+                .collect();
 
             tracing::info!(
                 turno,
@@ -503,8 +599,20 @@ async fn processar_turno(
                 let player_id = player_id.clone();
                 let texto_jogador = acao.response.clone();
                 let resultado_dados = resultado_dados.clone();
+                let rag = app.rag.clone();
                 async move {
-                    let texto = reacoes::processar_interacao(&pool, &llm, &guardrail, &npc, &player_id, &cena, resultado_dados.as_ref(), &texto_jogador).await;
+                    let texto = reacoes::processar_interacao(
+                        &pool,
+                        &llm,
+                        &guardrail,
+                        &npc,
+                        &player_id,
+                        &cena,
+                        resultado_dados.as_ref(),
+                        &texto_jogador,
+                        rag.as_ref(),
+                    )
+                    .await;
                     (npc.id.clone(), texto)
                 }
             }))
@@ -513,7 +621,12 @@ async fn processar_turno(
             let mut eventos: Vec<Event> = respostas
                 .iter()
                 .map(|(npc_id, texto)| {
-                    Event::new(EventType::Dialogo, npc_id.clone(), turno, serde_json::json!({ "texto": texto }))
+                    Event::new(
+                        EventType::Dialogo,
+                        npc_id.clone(),
+                        turno,
+                        serde_json::json!({ "texto": texto }),
+                    )
                 })
                 .collect();
 
@@ -539,15 +652,22 @@ async fn processar_turno(
             let contexto = format!(
                 "Ação do jogador: {}\n{}",
                 acao.response,
-                respostas.iter().map(|(id, t)| format!("{id} disse: {t}")).collect::<Vec<_>>().join("\n")
+                respostas
+                    .iter()
+                    .map(|(id, t)| format!("{id} disse: {t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             );
             let hp_antes_das_propostas = player.hp.atual;
             let llm_arbitro = app.llm_perfil("arbitro").await;
-            let propostas = state_changes::propor_e_validar(&llm_arbitro, &contexto, &roteados).await;
+            let propostas =
+                state_changes::propor_e_validar(&llm_arbitro, &contexto, &roteados).await;
             for proposta in &propostas {
                 match state_changes::aplicar(&mut player, turno, proposta) {
                     Ok(evento) => eventos.push(evento),
-                    Err(motivo) => tracing::warn!(%motivo, "proposta de mudanca de estado rejeitada"),
+                    Err(motivo) => {
+                        tracing::warn!(%motivo, "proposta de mudanca de estado rejeitada")
+                    }
                 }
             }
             if !propostas.is_empty() {
@@ -559,7 +679,12 @@ async fn processar_turno(
             // Morte por dano ambiental (não-combate) — ver Change-Fluxo-de-Morte.
             // Morte em combate é detectada dentro de `combate::resolver_rodada`.
             if hp_antes_das_propostas > 0 && player.hp.atual == 0 {
-                eventos.push(Event::new(EventType::JogadorMorreu, "orquestrador", turno, serde_json::json!({ "causa": "dano ambiental" })));
+                eventos.push(Event::new(
+                    EventType::JogadorMorreu,
+                    "orquestrador",
+                    turno,
+                    serde_json::json!({ "causa": "dano ambiental" }),
+                ));
             }
 
             // Início de combate: o Mestre de Jogo decide SE a ação inicia
@@ -570,7 +695,9 @@ async fn processar_turno(
                 .filter(|n| n.location_id == player.location_id)
                 .collect::<Vec<_>>();
             if !combatentes.is_empty() {
-                if let Some(alvo_id) = mestre::avaliar_inicio_combate(&app.llm, &acao.response, &combatentes).await {
+                if let Some(alvo_id) =
+                    mestre::avaliar_inicio_combate(&app.llm, &acao.response, &combatentes).await
+                {
                     let seed = rand::random::<u64>();
                     match combate::iniciar(&app.pool, &player_id, &alvo_id, seed).await {
                         Ok(_) => {
@@ -610,7 +737,11 @@ async fn processar_turno(
 
     publicar_lote(&app, &eventos).await;
 
-    Json(TurnResult { turno, eventos, presentes })
+    Json(TurnResult {
+        turno,
+        eventos,
+        presentes,
+    })
 }
 
 /// Turno dentro de um combate ativo: classifica a ação (atacar/fugir/outro)
@@ -643,7 +774,8 @@ async fn processar_turno_de_combate(
 
     let tipo_acao = mestre::avaliar_acao_combate(&app.llm, &acao.response).await;
     let seed = rand::random::<u64>();
-    let resultado = combate::resolver_rodada(&mut combate, player, &mut npc, tipo_acao, turno, seed);
+    let resultado =
+        combate::resolver_rodada(&mut combate, player, &mut npc, tipo_acao, turno, seed);
 
     if let Err(err) = db::upsert_npc(&app.pool, &npc).await {
         tracing::error!(%err, "falha ao persistir npc apos rodada de combate");
@@ -700,7 +832,9 @@ fn spawn_subscriber(client: async_nats::Client, app: AppState) {
                 continue;
             }
 
-            let Ok(payload) = serde_json::from_value::<ColisaoJogadorAgentePayload>(evento.payload.clone()) else {
+            let Ok(payload) =
+                serde_json::from_value::<ColisaoJogadorAgentePayload>(evento.payload.clone())
+            else {
                 tracing::warn!("colisao_jogador_agente com payload invalido");
                 continue;
             };
@@ -711,7 +845,11 @@ fn spawn_subscriber(client: async_nats::Client, app: AppState) {
     });
 }
 
-async fn reagir_a_colisao(client: async_nats::Client, app: AppState, colisao: ColisaoJogadorAgentePayload) {
+async fn reagir_a_colisao(
+    client: async_nats::Client,
+    app: AppState,
+    colisao: ColisaoJogadorAgentePayload,
+) {
     let npc = match db::get_npc(&app.pool, &colisao.agent_id).await {
         Ok(Some(npc)) => npc,
         _ => {
@@ -723,9 +861,25 @@ async fn reagir_a_colisao(client: async_nats::Client, app: AppState, colisao: Co
     let turno = app.turno.fetch_add(1, Ordering::SeqCst);
     let cena = mestre::resolver_cena(&app.pool, &app.llm, &colisao.location_id).await;
     let abertura = "O NPC encontra o jogador por acaso.";
-    let texto = reacoes::processar_interacao(&app.pool, &app.llm, &app.guardrail_saida, &npc, &colisao.player_id, &cena, None, abertura).await;
+    let texto = reacoes::processar_interacao(
+        &app.pool,
+        &app.llm,
+        &app.guardrail_saida,
+        &npc,
+        &colisao.player_id,
+        &cena,
+        None,
+        abertura,
+        app.rag.as_ref(),
+    )
+    .await;
 
-    let evento_dialogo = Event::new(EventType::Dialogo, npc.id.clone(), turno, serde_json::json!({ "texto": texto }));
+    let evento_dialogo = Event::new(
+        EventType::Dialogo,
+        npc.id.clone(),
+        turno,
+        serde_json::json!({ "texto": texto }),
+    );
     publicar_lote(&app, &[evento_dialogo]).await;
 
     let evento_finalizado = Event::new(

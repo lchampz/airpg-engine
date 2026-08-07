@@ -2,9 +2,11 @@ use crate::combate::TipoAcaoCombate;
 use crate::db;
 use crate::jsonutil::extrair_json;
 use crate::llm::LlmClient;
+use crate::rag::RagIndex;
 use crate::state::{Cena, Npc};
 use serde::Deserialize;
 use sqlx::sqlite::SqlitePool;
+use std::sync::Arc;
 
 /// O Mestre de Jogo é o único papel que cria e enriquece fatos de mundo (ver
 /// Mestre-de-Jogo-e-Cena no vault). Agentes/NPCs nunca inventam isso — só leem
@@ -36,7 +38,12 @@ pub async fn resolver_cena(pool: &SqlitePool, llm: &LlmClient, location_id: &str
     };
 
     let cena = match gerada {
-        Some(g) => Cena { location_id: location_id.to_string(), nome: g.nome, descricao: g.descricao, fatos_estabelecidos: vec![] },
+        Some(g) => Cena {
+            location_id: location_id.to_string(),
+            nome: g.nome,
+            descricao: g.descricao,
+            fatos_estabelecidos: vec![],
+        },
         None => Cena {
             location_id: location_id.to_string(),
             nome: location_id.replace('_', " "),
@@ -52,8 +59,14 @@ pub async fn resolver_cena(pool: &SqlitePool, llm: &LlmClient, location_id: &str
     cena
 }
 
-const ATRIBUTOS_VALIDOS: &[&str] =
-    &["forca", "destreza", "constituicao", "inteligencia", "sabedoria", "carisma"];
+const ATRIBUTOS_VALIDOS: &[&str] = &[
+    "forca",
+    "destreza",
+    "constituicao",
+    "inteligencia",
+    "sabedoria",
+    "carisma",
+];
 const DIFICULDADE_MIN: u32 = 5;
 const DIFICULDADE_MAX: u32 = 25;
 
@@ -88,8 +101,31 @@ pub struct VerificacaoTeste {
 /// resultado do teste em si, que é sempre a rolagem determinística de
 /// `skills::skill_dados`. Isso é o que impede a IA de simplesmente narrar um
 /// sucesso ou fracasso por conveniência dramática.
-pub async fn avaliar_verificacao(llm: &LlmClient, acao: &str) -> VerificacaoTeste {
-    let proposta = match llm.complete(SYSTEM_PROMPT_VERIFICACAO, acao).await {
+///
+/// `rag` é opcional (ver Change-RAG-SRD-e-Desktop): quando presente, injeta
+/// texto de regra real do SRD relevante pra ação (ex: qual CD uma condição
+/// específica normalmente exige) como contexto extra pro LLM decidir a
+/// dificuldade — nunca decide o valor por conta própria, só fundamenta a
+/// escolha do LLM em texto real em vez de "chutar" uma dificuldade.
+pub async fn avaliar_verificacao(
+    llm: &LlmClient,
+    acao: &str,
+    rag: Option<&Arc<RagIndex>>,
+) -> VerificacaoTeste {
+    let entrada = match rag {
+        Some(indice) => {
+            let chunks = indice.buscar_relevantes(acao, 2).await;
+            let contexto = crate::rag::formatar_para_prompt(&chunks);
+            if contexto.is_empty() {
+                acao.to_string()
+            } else {
+                format!("{acao}\n\nRegras do sistema potencialmente relevantes (use como referência de dificuldade, não leia ao jogador):\n{contexto}")
+            }
+        }
+        None => acao.to_string(),
+    };
+
+    let proposta = match llm.complete(SYSTEM_PROMPT_VERIFICACAO, &entrada).await {
         Ok(resposta) => extrair_json::<VerificacaoProposta>(&resposta),
         Err(err) => {
             tracing::error!(%err, "falha ao consultar o Mestre de Jogo para decidir teste de dados");
@@ -100,11 +136,20 @@ pub async fn avaliar_verificacao(llm: &LlmClient, acao: &str) -> VerificacaoTest
     match proposta {
         Some(p) if p.precisa_teste => VerificacaoTeste {
             precisa_teste: true,
-            atributo: if ATRIBUTOS_VALIDOS.contains(&p.atributo.as_str()) { p.atributo } else { "geral".to_string() },
+            atributo: if ATRIBUTOS_VALIDOS.contains(&p.atributo.as_str()) {
+                p.atributo
+            } else {
+                "geral".to_string()
+            },
             dificuldade: p.dificuldade.clamp(DIFICULDADE_MIN, DIFICULDADE_MAX),
             descricao: p.descricao,
         },
-        _ => VerificacaoTeste { precisa_teste: false, atributo: String::new(), dificuldade: 0, descricao: String::new() },
+        _ => VerificacaoTeste {
+            precisa_teste: false,
+            atributo: String::new(),
+            dificuldade: 0,
+            descricao: String::new(),
+        },
     }
 }
 
@@ -124,12 +169,20 @@ struct InicioCombateProposto {
 /// `combate::resolver_rodada`, determinístico). Só considera `alvo_id` que de
 /// fato está na lista de combatentes recebida — não confia cegamente no que o
 /// LLM devolve.
-pub async fn avaliar_inicio_combate(llm: &LlmClient, acao: &str, combatentes: &[&Npc]) -> Option<String> {
+pub async fn avaliar_inicio_combate(
+    llm: &LlmClient,
+    acao: &str,
+    combatentes: &[&Npc],
+) -> Option<String> {
     if combatentes.is_empty() {
         return None;
     }
 
-    let lista = combatentes.iter().map(|n| format!("{} (id: {})", n.nome, n.id)).collect::<Vec<_>>().join(", ");
+    let lista = combatentes
+        .iter()
+        .map(|n| format!("{} (id: {})", n.nome, n.id))
+        .collect::<Vec<_>>()
+        .join(", ");
     let entrada = format!("Criaturas hostis presentes: {lista}\nAção do jogador: {acao}");
 
     let proposta = match llm.complete(SYSTEM_PROMPT_INICIO_COMBATE, &entrada).await {
@@ -140,9 +193,12 @@ pub async fn avaliar_inicio_combate(llm: &LlmClient, acao: &str, combatentes: &[
         }
     };
 
-    proposta
-        .filter(|p| p.inicia_combate)
-        .and_then(|p| combatentes.iter().find(|n| n.id == p.alvo_id).map(|n| n.id.clone()))
+    proposta.filter(|p| p.inicia_combate).and_then(|p| {
+        combatentes
+            .iter()
+            .find(|n| n.id == p.alvo_id)
+            .map(|n| n.id.clone())
+    })
 }
 
 const SYSTEM_PROMPT_DESTINATARIOS: &str = r#"Você é o Mestre de Jogo de um RPG de fantasia medieval. Vários personagens estão na mesma cena que o jogador. Decida quais deles devem reagir à ação do jogador neste turno.
@@ -176,7 +232,11 @@ pub async fn avaliar_destinatarios(llm: &LlmClient, acao: &str, presentes: &[&Np
     let lista = presentes
         .iter()
         .map(|n| {
-            let papel = if n.descricao.is_empty() { "sem papel definido".to_string() } else { n.descricao.clone() };
+            let papel = if n.descricao.is_empty() {
+                "sem papel definido".to_string()
+            } else {
+                n.descricao.clone()
+            };
             format!("{} (id: {}, papel: {})", n.nome, n.id, papel)
         })
         .collect::<Vec<_>>()
@@ -193,7 +253,11 @@ pub async fn avaliar_destinatarios(llm: &LlmClient, acao: &str, presentes: &[&Np
 
     match proposta {
         Some(p) => {
-            let filtrados: Vec<String> = p.destinatarios.into_iter().filter(|id| todos.contains(id)).collect();
+            let filtrados: Vec<String> = p
+                .destinatarios
+                .into_iter()
+                .filter(|id| todos.contains(id))
+                .collect();
             if filtrados.is_empty() {
                 todos
             } else {
