@@ -1,3 +1,4 @@
+use crate::jsonutil::extrair_json;
 use crate::llm::LlmClient;
 use serde::Deserialize;
 
@@ -33,7 +34,7 @@ impl GuardrailSaida {
     pub async fn revisar(&self, texto_gerado: &str) -> String {
         for tentativa in 1..=MAX_TENTATIVAS {
             match self.llm.complete(SYSTEM_PROMPT, texto_gerado).await {
-                Ok(resposta) => match parse_veredito(&resposta) {
+                Ok(resposta) => match extrair_json::<Veredito>(&resposta) {
                     Some(v) if v.aprovado => return texto_gerado.to_string(),
                     Some(v) => {
                         let motivo = v.motivo.unwrap_or_else(|| "sem motivo informado".into());
@@ -53,10 +54,4 @@ impl GuardrailSaida {
 
         "O narrador hesita por um momento, incapaz de descrever o que aconteceu com clareza.".to_string()
     }
-}
-
-fn parse_veredito(resposta: &str) -> Option<Veredito> {
-    let inicio = resposta.find('{')?;
-    let fim = resposta.rfind('}')?;
-    serde_json::from_str(&resposta[inicio..=fim]).ok()
 }

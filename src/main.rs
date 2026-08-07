@@ -1,11 +1,13 @@
 mod db;
 mod events;
 mod guardrail;
+mod jsonutil;
 mod llm;
 mod orchestrator;
 mod reacoes;
 mod skills;
 mod state;
+mod state_changes;
 
 use axum::{extract::State, routing::{get, post}, Json, Router};
 use events::{AcaoJogadorPayload, ColisaoJogadorAgentePayload, Event, EventType};
@@ -100,7 +102,7 @@ async fn processar_turno(
 ) -> Json<TurnResult> {
     let turno = app.turno.fetch_add(1, Ordering::SeqCst);
 
-    let player = match db::get_player(&app.pool, PLAYER_ID).await {
+    let mut player = match db::get_player(&app.pool, PLAYER_ID).await {
         Ok(Some(p)) => p,
         _ => {
             tracing::error!("player nao encontrado no estado rigido, usando fallback");
@@ -133,19 +135,47 @@ async fn processar_turno(
                 "agentes roteados para o turno"
             );
 
-            let reacoes = futures::future::join_all(roteados.iter().map(|npc| {
+            let respostas = futures::future::join_all(roteados.iter().map(|npc| {
                 let llm = app.llm.clone();
                 let guardrail = app.guardrail_saida.clone();
                 let npc = (*npc).clone();
                 let texto_jogador = acao.response.clone();
                 async move {
                     let texto = reacoes::dialogar(&llm, &guardrail, &npc, &texto_jogador).await;
-                    Event::new(EventType::Dialogo, npc.id.clone(), turno, serde_json::json!({ "texto": texto }))
+                    (npc.id.clone(), texto)
                 }
             }))
             .await;
 
-            let mut eventos = reacoes;
+            let mut eventos: Vec<Event> = respostas
+                .iter()
+                .map(|(npc_id, texto)| {
+                    Event::new(EventType::Dialogo, npc_id.clone(), turno, serde_json::json!({ "texto": texto }))
+                })
+                .collect();
+
+            // Persistência de mudança de estado: o LLM só sugere (ver
+            // Estado-Rigido / state_changes.rs); o engine valida, aplica e
+            // persiste. A grande maioria dos turnos não muda nada — só
+            // eventos onde a proposta passa a whitelist entram no lote.
+            let contexto = format!(
+                "Ação do jogador: {}\n{}",
+                acao.response,
+                respostas.iter().map(|(id, t)| format!("{id} disse: {t}")).collect::<Vec<_>>().join("\n")
+            );
+            let propostas = state_changes::propor_mudancas(&app.llm, &contexto).await;
+            for proposta in &propostas {
+                match state_changes::aplicar(&mut player, turno, proposta) {
+                    Ok(evento) => eventos.push(evento),
+                    Err(motivo) => tracing::warn!(%motivo, "proposta de mudanca de estado rejeitada"),
+                }
+            }
+            if !propostas.is_empty() {
+                if let Err(err) = db::upsert_player(&app.pool, &player).await {
+                    tracing::error!(%err, "falha ao persistir estado do jogador");
+                }
+            }
+
             eventos.push(app.orchestrator.evento_fim_de_turno(turno, &roteados));
             eventos
         }

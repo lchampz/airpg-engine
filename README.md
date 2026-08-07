@@ -35,19 +35,21 @@ Variáveis de ambiente (todas com default sensato para dev local):
 
 Endpoints:
 - `GET /health`
-- `POST /turn` — recebe `{ "situation": "...", "response": "..." }`: roda o Guardrail de Entrada, gera o diálogo do agente reativo via LLM, filtra pelo Guardrail de Saída (segunda chamada de LLM), publica o evento no NATS e devolve o evento final
+- `POST /turn` — recebe `{ "situation": "...", "response": "..." }`: valida a ação (Guardrail de Entrada), roteia até 4 NPCs presentes na mesma `location_id` do jogador, gera a reação de cada um em paralelo via LLM, filtra pelo Guardrail de Saída, propõe e aplica mudanças de estado (ver abaixo), publica tudo no NATS e devolve o lote de eventos do turno (`{ "turno": n, "eventos": [...] }`)
 
 ## Status
 
-Walking skeleton com IA real ponta a ponta, testado contra Ollama local (`llama3.2`) via LiteLLM:
-- Guardrail de Entrada valida a ação (checagem mínima hoje, sem consultar o Estado Rígido ainda)
-- Diálogo do agente reativo é gerado por LLM real (hoje fixo em um único NPC — roteamento completo do Pool de Agentes com cap de 4/turno ainda não plugado neste endpoint)
-- Guardrail de Saída roda uma segunda chamada de LLM pedindo um veredito estruturado em JSON (`{"aprovado": bool, "motivo": ...}`), com fallback seguro (aprova) se a resposta não for parseável ou a chamada falhar
-- NATS conectado de fato: publica todo evento do turno e assina o barramento compartilhado com o `airpg-world` (recebe `colisao_jogador_agente` de NPCs autônomos, hoje só loga)
+IA real ponta a ponta, testado contra Ollama local (`llama3.2`) via LiteLLM, local e via Docker:
 
-**Latência observada localmente**: 13–46s por turno com `llama3.2` em CPU via Ollama (duas chamadas de LLM sequenciais: diálogo + guardrail de saída). Muito acima da meta de 5s/turno definida em `Decisoes-Resolvidas` — aceitável para debugar comportamento da IA, não para uso real. Antes de otimizar, considerar: modelo menor/quantizado, rodar as duas chamadas em paralelo quando possível, ou aceitar que produção usará um provedor hospedado (a troca é só de config no LiteLLM, o código do engine não muda).
+- **Guardrail de Entrada**: checagem mínima hoje (ação não-vazia), sem consultar o Estado Rígido ainda para validar viabilidade da ação
+- **Pool de Agentes reativo com roteamento real**: consulta NPCs por `location_id` no SQLite, ativa até 4 por turno em paralelo — testado com 2 NPCs na mesma sala respondendo e um terceiro em outra sala corretamente ignorado
+- **Guardrail de Saída**: segunda chamada de LLM pedindo veredito estruturado (`{"aprovado": bool, "motivo": ...}`), com fallback seguro se não parseável ou se a chamada falhar
+- **Persistência de mudança de estado** (`src/state_changes.rs`): o LLM só **sugere** mudanças (dano/cura em `player.hp`, itens em `player.inventario`) via um terceiro tipo de chamada estruturada; o engine valida contra uma whitelist de campo+operação, aplica com bounds (HP nunca sai de `[0, máximo]`, remoção de item exige que ele exista), persiste no SQLite e só então emite `mudanca_estado`. Testado: dano real reduziu HP de 10→0, cura no turno seguinte confirmou que o 0 tinha persistido (não era só estado em memória do request), e diálogo comum não gera mudança nenhuma (sem alucinação de efeito mecânico)
+- **NATS conectado nos dois sentidos**: engine publica todo evento do turno e assina o barramento do `airpg-world`; ao receber `colisao_jogador_agente` de um NPC autônomo, ativa o Pool de Agentes para aquele NPC especificamente e devolve `interacao_finalizada` para o Mundo Vivo retomar autonomia — ciclo completo testado local e via Docker
 
-Ainda não implementado: roteamento completo do Pool de Agentes (múltiplos NPCs por turno), persistência real do Estado Rígido nos endpoints (o pool SQLite existe, tabelas ainda não são lidas/escritas), reação do engine ao receber `colisao_jogador_agente` (hoje só loga, não aciona o Pool de Agentes automaticamente).
+**Latência observada localmente**: 6–46s por turno com `llama3.2` em CPU via Ollama, variando com quantas chamadas de LLM um turno dispara (diálogo × N agentes + guardrail × N + proposta de mudança de estado). Acima da meta de 5s/turno definida em `Decisoes-Resolvidas` na maioria dos casos — aceitável para debugar comportamento da IA, não para uso real. Produção trocaria de provedor só via config do LiteLLM, sem mudar código do engine.
+
+Ainda não implementado: o Guardrail de Entrada não consulta o Estado Rígido para validar viabilidade mecânica da ação (ex: usar item que não existe), sem lógica de combate/ordem de iniciativa, e mudanças de estado propostas não são visíveis aos NPCs no mesmo turno em que ocorrem (o contexto passado para a proposta de mudança inclui os diálogos gerados, mas os diálogos não sabem antecipadamente que uma mudança vai ser aplicada).
 
 ## Contexto arquitetural
 
