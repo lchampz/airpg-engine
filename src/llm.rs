@@ -51,14 +51,27 @@ impl LlmClient {
     }
 
     pub async fn complete(&self, system: &str, user: &str) -> anyhow::Result<String> {
-        let req = ChatRequest {
-            model: &self.model,
-            messages: vec![
-                ChatMessage { role: "system", content: system },
-                ChatMessage { role: "user", content: user },
-            ],
-            temperature: 0.7,
-        };
+        self.complete_with_history(system, &[], user).await
+    }
+
+    /// Como `complete`, mas incluindo o histórico recente de troca (memória de
+    /// curto prazo do agente — ver Memoria-Narrativa/AgentLoop-por-Personagem
+    /// no vault). `historico` é uma lista de pares (mensagem do jogador,
+    /// resposta do agente), do mais antigo para o mais recente.
+    pub async fn complete_with_history(
+        &self,
+        system: &str,
+        historico: &[(String, String)],
+        user: &str,
+    ) -> anyhow::Result<String> {
+        let mut messages = vec![ChatMessage { role: "system", content: system }];
+        for (prompt, resposta) in historico {
+            messages.push(ChatMessage { role: "user", content: prompt });
+            messages.push(ChatMessage { role: "assistant", content: resposta });
+        }
+        messages.push(ChatMessage { role: "user", content: user });
+
+        let req = ChatRequest { model: &self.model, messages, temperature: 0.7 };
 
         let resp = self
             .http

@@ -31,6 +31,21 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Memória de curto prazo por agente (ctx/last-interaction), ver
+    // Memoria-Narrativa no vault. Efêmera por natureza — perder isso num
+    // restart é aceitável, mas persistir evita reiniciar toda conversa a
+    // cada `docker compose up` durante o desenvolvimento.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS npc_memoria (
+            npc_id TEXT PRIMARY KEY,
+            ctx TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     seed_se_vazio(&pool).await?;
 
     Ok(pool)
@@ -128,4 +143,34 @@ pub async fn get_npc(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<Npc>>
 pub async fn list_npcs(pool: &SqlitePool) -> anyhow::Result<Vec<Npc>> {
     let rows: Vec<(String,)> = sqlx::query_as("SELECT data FROM npcs").fetch_all(pool).await?;
     rows.into_iter().map(|(data,)| serde_json::from_str(&data).map_err(Into::into)).collect()
+}
+
+/// Máximo de trocas (prompt+resposta) mantidas por agente — memória de curto
+/// prazo tem limite natural de tamanho (ver Memoria-Narrativa no vault).
+pub const MAX_TROCAS_MEMORIA: usize = 6;
+
+pub async fn get_memoria(pool: &SqlitePool, npc_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT ctx FROM npc_memoria WHERE npc_id = ?")
+        .bind(npc_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(match row {
+        Some((ctx,)) => serde_json::from_str(&ctx)?,
+        None => vec![],
+    })
+}
+
+pub async fn registrar_troca(pool: &SqlitePool, npc_id: &str, prompt: String, resposta: String) -> anyhow::Result<()> {
+    let mut ctx = get_memoria(pool, npc_id).await?;
+    ctx.push((prompt, resposta));
+    if ctx.len() > MAX_TROCAS_MEMORIA {
+        ctx.drain(0..ctx.len() - MAX_TROCAS_MEMORIA);
+    }
+    let data = serde_json::to_string(&ctx)?;
+    sqlx::query("INSERT INTO npc_memoria (npc_id, ctx) VALUES (?, ?) ON CONFLICT(npc_id) DO UPDATE SET ctx = excluded.ctx")
+        .bind(npc_id)
+        .bind(data)
+        .execute(pool)
+        .await?;
+    Ok(())
 }

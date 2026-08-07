@@ -138,10 +138,15 @@ async fn processar_turno(
             let respostas = futures::future::join_all(roteados.iter().map(|npc| {
                 let llm = app.llm.clone();
                 let guardrail = app.guardrail_saida.clone();
+                let pool = app.pool.clone();
                 let npc = (*npc).clone();
                 let texto_jogador = acao.response.clone();
                 async move {
-                    let texto = reacoes::dialogar(&llm, &guardrail, &npc, &texto_jogador).await;
+                    let historico = db::get_memoria(&pool, &npc.id).await.unwrap_or_default();
+                    let texto = reacoes::dialogar(&llm, &guardrail, &npc, &historico, &texto_jogador).await;
+                    if let Err(err) = db::registrar_troca(&pool, &npc.id, texto_jogador.clone(), texto.clone()).await {
+                        tracing::error!(%err, npc = %npc.id, "falha ao persistir memoria de curto prazo");
+                    }
                     (npc.id.clone(), texto)
                 }
             }))
@@ -247,7 +252,11 @@ async fn reagir_a_colisao(client: async_nats::Client, app: AppState, colisao: Co
 
     let turno = app.turno.fetch_add(1, Ordering::SeqCst);
     let abertura = "O NPC encontra o jogador por acaso.";
-    let texto = reacoes::dialogar(&app.llm, &app.guardrail_saida, &npc, abertura).await;
+    let historico = db::get_memoria(&app.pool, &npc.id).await.unwrap_or_default();
+    let texto = reacoes::dialogar(&app.llm, &app.guardrail_saida, &npc, &historico, abertura).await;
+    if let Err(err) = db::registrar_troca(&app.pool, &npc.id, abertura.to_string(), texto.clone()).await {
+        tracing::error!(%err, npc = %npc.id, "falha ao persistir memoria de curto prazo");
+    }
 
     let evento_dialogo = Event::new(EventType::Dialogo, npc.id.clone(), turno, serde_json::json!({ "texto": texto }));
     publicar_lote(&app, &[evento_dialogo]).await;
