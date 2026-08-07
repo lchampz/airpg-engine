@@ -25,7 +25,7 @@ pub async fn processar_interacao(
 ) -> String {
     let mut memoria = db::get_memoria(pool, &npc.id, player_id).await.unwrap_or_default();
 
-    let texto = dialogar(llm, guardrail, npc, cena, &memoria, resultado_dados, entrada).await;
+    let texto = dialogar(pool, llm, guardrail, npc, cena, &memoria, resultado_dados, entrada).await;
 
     db::registrar_troca(&mut memoria, entrada.to_string(), texto.clone());
 
@@ -45,6 +45,7 @@ pub async fn processar_interacao(
 }
 
 async fn dialogar(
+    pool: &SqlitePool,
     llm: &LlmClient,
     guardrail: &GuardrailSaida,
     npc: &Npc,
@@ -53,7 +54,38 @@ async fn dialogar(
     resultado_dados: Option<&ResultadoDados>,
     entrada: &str,
 ) -> String {
-    let system = montar_system_prompt(npc, cena, memoria, resultado_dados);
+    let texto = gerar_e_revisar(llm, guardrail, npc, cena, memoria, resultado_dados, entrada, None).await;
+
+    // Anti-repetição (ver Change-Economia-Viva-e-Consistencia): NPCs
+    // diferentes (ou o mesmo NPC em sessões diferentes) tendiam a abrir com
+    // a mesma saudação genérica. Uma colisão só pede UMA nova geração — não
+    // vale a pena um loop, e "quase igual de novo" ainda é melhor que nada.
+    let texto = match db::frase_repetida(pool, &npc.location_id, &texto).await {
+        Ok(Some(frase_antiga)) => {
+            tracing::info!(npc = %npc.id, "reacoes: fala colidiu com frase recente, pedindo nova geracao");
+            gerar_e_revisar(llm, guardrail, npc, cena, memoria, resultado_dados, entrada, Some(&frase_antiga)).await
+        }
+        _ => texto,
+    };
+
+    if let Err(err) = db::registrar_frase_recente(pool, &npc.location_id, &texto).await {
+        tracing::warn!(%err, npc = %npc.id, "falha ao registrar frase recente");
+    }
+
+    texto
+}
+
+async fn gerar_e_revisar(
+    llm: &LlmClient,
+    guardrail: &GuardrailSaida,
+    npc: &Npc,
+    cena: &Cena,
+    memoria: &MemoriaNpc,
+    resultado_dados: Option<&ResultadoDados>,
+    entrada: &str,
+    evitar_frase: Option<&str>,
+) -> String {
+    let system = montar_system_prompt(npc, cena, memoria, resultado_dados, evitar_frase);
 
     let bruto = match llm.complete_with_history(&system, &memoria.ctx, entrada).await {
         Ok(texto) => texto,
@@ -77,7 +109,7 @@ async fn dialogar(
     guardrail.revisar(&bruto, resultado_dados).await
 }
 
-fn montar_system_prompt(npc: &Npc, cena: &Cena, memoria: &MemoriaNpc, resultado_dados: Option<&ResultadoDados>) -> String {
+fn montar_system_prompt(npc: &Npc, cena: &Cena, memoria: &MemoriaNpc, resultado_dados: Option<&ResultadoDados>, evitar_frase: Option<&str>) -> String {
     let mut partes = vec![format!(
         "Você é {}, um NPC num RPG de fantasia medieval. Sua atitude de base com o jogador é: {}.{}",
         npc.nome,
@@ -88,6 +120,10 @@ fn montar_system_prompt(npc: &Npc, cena: &Cena, memoria: &MemoriaNpc, resultado_
             format!(" {}", npc.descricao)
         }
     )];
+
+    if !npc.interesses.is_empty() {
+        partes.push(format!("Suas motivações/necessidades concretas: {}.", npc.interesses.join("; ")));
+    }
 
     partes.push(format!(
         "Você está em {} ({}). Fatos estabelecidos sobre este lugar — você NÃO pode contradizer ou inventar por cima deles: {}",
@@ -133,6 +169,12 @@ fn montar_system_prompt(npc: &Npc, cena: &Cena, memoria: &MemoriaNpc, resultado_
          Pode misturar os dois. Exemplos: '*cruza os braços* -Não recebo estranhos de bom grado.' ou '-Saia daqui. *aponta para a porta*'."
             .to_string(),
     );
+
+    if let Some(frase) = evitar_frase {
+        partes.push(format!(
+            "IMPORTANTE: você (ou outro personagem por aqui) já disse algo muito parecido com isto recentemente — não repita: \"{frase}\". Responda de um jeito genuinamente diferente."
+        ));
+    }
 
     partes.join("\n\n")
 }

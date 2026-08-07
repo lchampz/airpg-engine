@@ -129,14 +129,16 @@ async fn gerar_conversa(
     turno_global: u64,
     timestamp: &str,
 ) {
-    let descricao_a = if a.descricao.is_empty() { "sem descricao" } else { &a.descricao };
-    let descricao_b = if b.descricao.is_empty() { "sem descricao" } else { &b.descricao };
+    let descricao_a = if a.descricao.is_empty() { "sem descricao".to_string() } else { a.descricao.clone() };
+    let descricao_b = if b.descricao.is_empty() { "sem descricao".to_string() } else { b.descricao.clone() };
+    let interesses_a = if a.interesses.is_empty() { String::new() } else { format!(" Motivações: {}.", a.interesses.join("; ")) };
+    let interesses_b = if b.interesses.is_empty() { String::new() } else { format!(" Motivações: {}.", b.interesses.join("; ")) };
     let system = format!(
         "Você está narrando uma conversa breve e natural entre dois personagens de um RPG de fantasia medieval, sem o jogador presente.\n\
-         {} (id: {}) — {}\n{} (id: {}) — {}\n\
+         {} (id: {}) — {}{}\n{} (id: {}) — {}{}\n\
          Responda APENAS com um JSON no formato {{\"falas\": [{{\"npc_id\": \"...\", \"texto\": \"...\"}}]}}, com 2 a 4 falas alternando entre os dois ids.\n\
          FORMATO OBRIGATÓRIO em cada texto: use *ação* para gesto/expressão (sem aspas) e -fala para diálogo direto (traço no início, sem aspas). Mantenha cada personagem na própria voz e papel, nunca invente fatos novos do mundo.",
-        a.nome, a.id, descricao_a, b.nome, b.id, descricao_b,
+        a.nome, a.id, descricao_a, interesses_a, b.nome, b.id, descricao_b, interesses_b,
     );
     let entrada = format!("Local: {location_id}. Gere a conversa agora.");
 
@@ -162,6 +164,22 @@ async fn gerar_conversa(
         }
 
         let texto_revisado = guardrail.revisar(&fala.texto, None).await;
+
+        // Anti-repetição (ver Change-Economia-Viva-e-Consistencia): conversas
+        // ambiente entre NPCs diferentes tendiam a abrir com a mesma saudação
+        // genérica de sempre. Aqui não vale a pena pedir regeração de uma
+        // fala isolada dentro de um JSON de várias — só descarta a fala
+        // repetida, o resto da conversa segue.
+        match db::frase_repetida(pool, location_id, &texto_revisado).await {
+            Ok(Some(_)) => {
+                tracing::info!(npc_id = %fala.npc_id, "livre-arbitrio: fala ambiente colidiu com frase recente, descartando");
+                continue;
+            }
+            _ => {}
+        }
+        if let Err(err) = db::registrar_frase_recente(pool, location_id, &texto_revisado).await {
+            tracing::warn!(%err, "livre-arbitrio: falha ao registrar frase recente");
+        }
 
         if let Err(err) =
             db::registrar_acao_global(pool, turno_global as i64, &fala.npc_id, "npc", "conversa_ambiente", &texto_revisado, location_id, timestamp)

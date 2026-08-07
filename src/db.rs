@@ -123,6 +123,23 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Anti-repetição de diálogo (ver Change-Economia-Viva-e-Consistencia):
+    // últimas falas por localização, normalizadas, pra checar similaridade
+    // antes de aceitar uma fala nova — sem isso, NPCs diferentes (ou o mesmo
+    // NPC em sessões diferentes) repetem a mesma saudação genérica.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS frases_recentes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location_id TEXT NOT NULL,
+            texto_normalizado TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     // Perfis de modelo LLM (ver Estrategia-Custo-Tokens no vault): "mundo"
     // (geopolítica/economia/tick autônomo, deve ser o mais barato possível)
     // e "personagens" (geração de personagem sob demanda, pode usar um
@@ -787,3 +804,103 @@ pub async fn consumir_eventos_ambiente_pendentes(pool: &SqlitePool, location_id:
     rows.into_iter().map(|(_, data)| serde_json::from_str(&data).map_err(Into::into)).collect()
 }
 
+/// Normaliza pra comparação de similaridade: minúsculas, só letras/números/
+/// espaço, espaços colapsados. Não remove acentuação de propósito — é caro
+/// de fazer certo em Rust sem uma crate nova, e "não repetir literalmente"
+/// já cobre o caso mais comum (saudações idênticas ou quase-idênticas).
+fn normalizar_frase(texto: &str) -> String {
+    texto
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn similaridade_jaccard(a: &str, b: &str) -> f64 {
+    use std::collections::HashSet;
+    let sa: HashSet<&str> = a.split_whitespace().collect();
+    let sb: HashSet<&str> = b.split_whitespace().collect();
+    if sa.is_empty() || sb.is_empty() {
+        return 0.0;
+    }
+    let inter = sa.intersection(&sb).count() as f64;
+    let uni = sa.union(&sb).count() as f64;
+    inter / uni
+}
+
+/// Limiar de similaridade (Jaccard sobre palavras) acima do qual uma fala
+/// nova é considerada repetição de uma frase recente na mesma localização.
+const LIMIAR_REPETICAO: f64 = 0.6;
+/// Quantas falas recentes por localização são comparadas — janela curta de
+/// propósito, "recente" é o que importa pra soar repetitivo pro jogador.
+const JANELA_FRASES_RECENTES: i64 = 10;
+
+/// Ver Change-Economia-Viva-e-Consistencia: compara `texto` contra as
+/// últimas falas da mesma localização. Retorna a frase antiga colidida, se
+/// houver, pra o chamador decidir pedir uma nova geração ao LLM.
+pub async fn frase_repetida(pool: &SqlitePool, location_id: &str, texto: &str) -> anyhow::Result<Option<String>> {
+    let normalizado = normalizar_frase(texto);
+    let candidatos: Vec<(String,)> = sqlx::query_as(
+        "SELECT texto_normalizado FROM frases_recentes WHERE location_id = ? ORDER BY id DESC LIMIT ?",
+    )
+    .bind(location_id)
+    .bind(JANELA_FRASES_RECENTES)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(candidatos.into_iter().find(|(antigo,)| similaridade_jaccard(&normalizado, antigo) >= LIMIAR_REPETICAO).map(|(antigo,)| antigo))
+}
+
+/// Registra `texto` como dito em `location_id` e poda pra manter só as
+/// últimas `JANELA_FRASES_RECENTES * 5` entradas por localização — margem
+/// maior que a janela de comparação, só pra não crescer sem limite.
+pub async fn registrar_frase_recente(pool: &SqlitePool, location_id: &str, texto: &str) -> anyhow::Result<()> {
+    let normalizado = normalizar_frase(texto);
+    sqlx::query("INSERT INTO frases_recentes (location_id, texto_normalizado, timestamp) VALUES (?, ?, ?)")
+        .bind(location_id)
+        .bind(&normalizado)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await?;
+
+    let manter = JANELA_FRASES_RECENTES * 5;
+    sqlx::query(
+        "DELETE FROM frases_recentes WHERE location_id = ? AND id NOT IN (
+            SELECT id FROM frases_recentes WHERE location_id = ? ORDER BY id DESC LIMIT ?
+        )",
+    )
+    .bind(location_id)
+    .bind(location_id)
+    .bind(manter)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+
+#[cfg(test)]
+mod tests_anti_repeticao {
+    use super::*;
+
+    #[test]
+    fn normaliza_removendo_pontuacao_e_caixa() {
+        assert_eq!(normalizar_frase("Bem-vindo, VIAJANTE!!"), "bem vindo viajante");
+    }
+
+    #[test]
+    fn similaridade_alta_para_frases_quase_identicas() {
+        let a = normalizar_frase("Bem vindo ao Porto Velho, o que te traz aqui?");
+        let b = normalizar_frase("Bem vindo ao Porto Velho, o que voce busca aqui?");
+        assert!(similaridade_jaccard(&a, &b) >= LIMIAR_REPETICAO);
+    }
+
+    #[test]
+    fn similaridade_baixa_para_frases_distintas() {
+        let a = normalizar_frase("A cerveja custa cinco moedas por copo");
+        let b = normalizar_frase("O guarda observa a floresta em silencio");
+        assert!(similaridade_jaccard(&a, &b) < LIMIAR_REPETICAO);
+    }
+}
