@@ -69,6 +69,7 @@ pub async fn tick(pool: SqlitePool, llm: LlmClient, guardrail: std::sync::Arc<Gu
     let candidatos = &por_local[&location_id];
 
     let ator = &candidatos[rand::random::<usize>() % candidatos.len()];
+    tracing::info!(turno_global, %location_id, ator_id = %ator.id, candidatos = candidatos.len(), "livre-arbitrio: tick disparado");
 
     let lista = candidatos
         .iter()
@@ -147,7 +148,10 @@ async fn gerar_conversa(
         }
     };
 
-    let Some(proposta) = extrair_json::<ConversaProposta>(&resposta) else { return };
+    let Some(proposta) = extrair_json::<ConversaProposta>(&resposta) else {
+        tracing::warn!(resposta = %resposta, "livre-arbitrio: resposta da conversa ambiente nao parseavel, descartando");
+        return;
+    };
 
     for fala in proposta.falas {
         if fala.npc_id != a.id && fala.npc_id != b.id {
