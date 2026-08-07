@@ -76,6 +76,18 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS descobertas (
+            player_id TEXT NOT NULL,
+            npc_id TEXT NOT NULL,
+            PRIMARY KEY (player_id, npc_id)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     seed_se_vazio(&pool).await?;
 
     Ok(pool)
@@ -136,6 +148,10 @@ async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
             dano_dado_faces: None,
             xp_recompensa: None,
             loot: vec![],
+            descricao: String::new(),
+            deslocamento: None,
+            imunidades: vec![],
+            resistencias: vec![],
         },
         Npc {
             id: "npc_cliente_gerta".into(),
@@ -149,6 +165,10 @@ async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
             dano_dado_faces: None,
             xp_recompensa: None,
             loot: vec![],
+            descricao: String::new(),
+            deslocamento: None,
+            imunidades: vec![],
+            resistencias: vec![],
         },
         Npc {
             id: "npc_guarda_holt".into(),
@@ -162,6 +182,10 @@ async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
             dano_dado_faces: None,
             xp_recompensa: None,
             loot: vec![],
+            descricao: String::new(),
+            deslocamento: None,
+            imunidades: vec![],
+            resistencias: vec![],
         },
         npc_lobo_seed(),
     ];
@@ -187,6 +211,10 @@ fn npc_lobo_seed() -> Npc {
         dano_dado_faces: Some(4),
         xp_recompensa: Some(50),
         loot: vec!["presa_de_lobo".into()],
+        descricao: "Imóveis como montanhas, até que a tumba seja violada — então caçam em silêncio, cercando a presa antes de atacar em bando.".into(),
+        deslocamento: Some("9m".into()),
+        imunidades: vec![],
+        resistencias: vec!["frio".into()],
     }
 }
 
@@ -240,6 +268,25 @@ pub async fn get_npc(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<Npc>>
 pub async fn list_npcs(pool: &SqlitePool) -> anyhow::Result<Vec<Npc>> {
     let rows: Vec<(String,)> = sqlx::query_as("SELECT data FROM npcs").fetch_all(pool).await?;
     rows.into_iter().map(|(data,)| serde_json::from_str(&data).map_err(Into::into)).collect()
+}
+
+/// Marca que `player_id` já encontrou `npc_id` (ver Change-Bestiario) — só
+/// jogadores que já descobriram uma criatura a veem no bestiário.
+pub async fn marcar_descoberto(pool: &SqlitePool, player_id: &str, npc_id: &str) -> anyhow::Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO descobertas (player_id, npc_id) VALUES (?, ?)")
+        .bind(player_id)
+        .bind(npc_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn npcs_descobertos_por(pool: &SqlitePool, player_id: &str) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT npc_id FROM descobertas WHERE player_id = ?")
+        .bind(player_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(npc_id,)| npc_id).collect())
 }
 
 /// Máximo de trocas (prompt+resposta) mantidas na janela verbatim — o resto

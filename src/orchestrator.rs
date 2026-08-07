@@ -100,6 +100,10 @@ mod tests {
                 dano_dado_faces: None,
                 xp_recompensa: None,
                 loot: vec![],
+                descricao: String::new(),
+                deslocamento: None,
+                imunidades: vec![],
+                resistencias: vec![],
             })
             .collect();
         let roteados = orch.rotear_agentes(&p, &npcs);

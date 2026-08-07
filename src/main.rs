@@ -131,8 +131,20 @@ async fn obter_player(State(app): State<AppState>, headers: HeaderMap, Query(q):
     Json(player)
 }
 
-async fn listar_npcs(State(app): State<AppState>) -> Json<Vec<state::Npc>> {
-    Json(db::list_npcs(&app.pool).await.unwrap_or_default())
+#[derive(Deserialize)]
+struct ListarNpcsQuery {
+    descobertos_por: Option<String>,
+}
+
+async fn listar_npcs(State(app): State<AppState>, Query(q): Query<ListarNpcsQuery>) -> Json<Vec<state::Npc>> {
+    let npcs = db::list_npcs(&app.pool).await.unwrap_or_default();
+    match q.descobertos_por {
+        Some(player_id) => {
+            let descobertos = db::npcs_descobertos_por(&app.pool, &player_id).await.unwrap_or_default();
+            Json(npcs.into_iter().filter(|npc| descobertos.contains(&npc.id)).collect())
+        }
+        None => Json(npcs),
+    }
 }
 
 async fn obter_npc(State(app): State<AppState>, Path(id): Path<String>) -> Json<Option<state::Npc>> {
@@ -261,6 +273,17 @@ async fn processar_turno(
                 agentes = ?roteados.iter().map(|n| &n.id).collect::<Vec<_>>(),
                 "agentes roteados para o turno"
             );
+
+            for npc in &roteados {
+                let pool = app.pool.clone();
+                let player_id = player_id.clone();
+                let npc_id = npc.id.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = db::marcar_descoberto(&pool, &player_id, &npc_id).await {
+                        tracing::warn!(%err, %player_id, %npc_id, "falha ao marcar npc como descoberto");
+                    }
+                });
+            }
 
             let respostas = futures::future::join_all(roteados.iter().map(|npc| {
                 let pool = app.pool.clone();
