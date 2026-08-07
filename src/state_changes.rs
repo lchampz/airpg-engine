@@ -140,6 +140,7 @@ mod tests {
             nivel: 1,
             classe: "guerreiro".into(),
             xp: 0,
+            nome_personagem: None,
         }
     }
 

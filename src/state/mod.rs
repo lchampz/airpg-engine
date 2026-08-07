@@ -15,6 +15,10 @@ pub struct Player {
     /// `nivel_por_xp` — nunca setado diretamente pelo LLM.
     #[serde(default)]
     pub xp: u32,
+    /// Nome de exibição do personagem, escolhido pelo jogador. `None` =
+    /// personagem ainda sem nome definido (ver Change-Ficha-Personagem).
+    #[serde(default)]
+    pub nome_personagem: Option<String>,
 }
 
 /// Limiares de XP por nível (índice = nível - 1). Constante no código, não no
@@ -22,6 +26,13 @@ pub struct Player {
 pub const LIMIARES_XP: &[u32] = &[0, 100, 250, 450, 700, 1000, 1400, 1900, 2500, 3200];
 /// Classe de armadura padrão do jogador sem equipamento (ver Change-Sistema-de-Combate).
 pub const PLAYER_CA_PADRAO: u32 = 10;
+
+/// Chaves canônicas e estáveis de `Player.atributos` — contrato usado pela
+/// UI (ficha do personagem) para saber quais atributos desenhar, já que o
+/// mapa em si permanece um `HashMap<String, i32>` livre no modelo
+/// (ver Change-Ficha-Personagem).
+pub const ATRIBUTOS_PADRAO: &[&str] =
+    &["forca", "destreza", "constituicao", "inteligencia", "sabedoria", "carisma"];
 
 pub fn nivel_por_xp(xp: u32) -> u32 {
     LIMIARES_XP.iter().filter(|&&limiar| xp >= limiar).count() as u32
@@ -35,12 +46,13 @@ impl Player {
         Self {
             id: id.into(),
             hp: Hp { atual: 10, maximo: 10 },
-            atributos: Default::default(),
+            atributos: ATRIBUTOS_PADRAO.iter().map(|&chave| (chave.to_string(), 10)).collect(),
             inventario: vec![],
             location_id: "taverna_porto_velho".into(),
             nivel: 1,
             classe: "guerreiro".into(),
             xp: 0,
+            nome_personagem: None,
         }
     }
 }
