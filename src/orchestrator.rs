@@ -26,9 +26,18 @@ impl Orchestrator {
 
     /// Roteamento: todo NPC na mesma location do jogador é candidato; cap de
     /// MAX_AGENTES_POR_TURNO por turno (ver Decisoes-Resolvidas).
+    /// NPCs com `hp` definido são combatentes puros (ver Change-Sistema-de-Combate),
+    /// não personagens de diálogo — rotear um lobo pro Pool de Agentes conversacional
+    /// gerava uma fala sem sentido no turno em que o combate começava (bug real
+    /// encontrado em teste). `combate::avaliar_inicio_combate` já lida com eles
+    /// separadamente via `combate::npcs_combatentes`.
     pub fn rotear_agentes<'a>(&self, player: &Player, npcs: &'a [Npc]) -> Vec<&'a Npc> {
         npcs.iter()
-            .filter(|npc| npc.location_id == player.location_id && npc.status != crate::state::NpcStatus::Morto)
+            .filter(|npc| {
+                npc.location_id == player.location_id
+                    && npc.status != crate::state::NpcStatus::Morto
+                    && npc.hp.is_none()
+            })
             .take(MAX_AGENTES_POR_TURNO)
             .collect()
     }
