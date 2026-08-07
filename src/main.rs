@@ -4,6 +4,7 @@ mod db;
 mod events;
 mod guardrail;
 mod jsonutil;
+mod livre_arbitrio;
 mod llm;
 mod mestre;
 mod orchestrator;
@@ -398,6 +399,19 @@ async fn processar_turno(
         });
     }
 
+    // Livre-Arbítrio: a cada 5 turnos globais (não por jogador — múltiplos
+    // jogadores compartilham o mesmo contador `app.turno`), dispara um tick
+    // de ação autônoma de NPC em segundo plano. Fire-and-forget, nunca
+    // atrasa a resposta deste turno — ver Módulos 2+3+6 em Tarefas-Pendentes.
+    if turno % 5 == 0 {
+        let pool_tick = app.pool.clone();
+        let llm_mundo = app.llm_perfil("mundo").await;
+        let guardrail_tick = app.guardrail_saida.clone();
+        tokio::spawn(async move {
+            livre_arbitrio::tick(pool_tick, llm_mundo, guardrail_tick, turno).await;
+        });
+    }
+
     let mut player = match db::get_ou_criar_player(&app.pool, &player_id).await {
         Ok(p) => p,
         Err(err) => {
@@ -410,7 +424,7 @@ async fn processar_turno(
 
     let mut presentes: Vec<String> = Vec::new();
 
-    let eventos = match app.orchestrator.validar_acao(&player, &acao) {
+    let mut eventos = match app.orchestrator.validar_acao(&player, &acao) {
         Err(rejeicao) => vec![Event::new(
             EventType::AcaoRejeitada,
             "guardrail_entrada",
@@ -573,6 +587,18 @@ async fn processar_turno(
             eventos
         }
     };
+
+    // Módulo 6 (Tarefas-Pendentes): entrega ao jogador qualquer conversa
+    // ambiente entre NPCs gerada pelo tick de Livre-Arbítrio enquanto ele não
+    // estava olhando — só se ele estiver na mesma localização agora.
+    match db::consumir_eventos_ambiente_pendentes(&app.pool, &player.location_id).await {
+        Ok(pendentes) if !pendentes.is_empty() => {
+            tracing::info!(turno, location_id = %player.location_id, quantidade = pendentes.len(), "entregando eventos ambiente pendentes");
+            eventos.splice(0..0, pendentes);
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(%err, "falha ao consumir eventos ambiente pendentes"),
+    }
 
     if let Err(err) = db::registrar_eventos_historico(&app.pool, &player_id, &eventos).await {
         tracing::warn!(%err, %player_id, "falha ao registrar historico de eventos");

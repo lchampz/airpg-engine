@@ -105,6 +105,24 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Fila de eventos ambiente por localização — ver Módulo 6 em
+    // Tarefas-Pendentes: quando o tick de Livre-Arbítrio (`livre_arbitrio.rs`)
+    // gera uma conversa entre dois NPCs, ela fica aqui até o próximo `/turn`
+    // de um jogador que esteja naquela `location_id`, que a entrega e marca
+    // como `entregue`. Evita precisar de um canal de push em tempo real.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS eventos_ambiente_pendentes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location_id TEXT NOT NULL,
+            evento TEXT NOT NULL,
+            entregue INTEGER NOT NULL DEFAULT 0
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     // Perfis de modelo LLM (ver Estrategia-Custo-Tokens no vault): "mundo"
     // (geopolítica/economia/tick autônomo, deve ser o mais barato possível)
     // e "personagens" (geração de personagem sob demanda, pode usar um
@@ -695,5 +713,45 @@ pub async fn historico_do_jogador(pool: &SqlitePool, player_id: &str, limite: i6
         .collect::<Result<_, _>>()?;
     eventos.reverse();
     Ok(eventos)
+}
+
+/// Enfileira um evento ambiente (ex: conversa entre dois NPCs gerada pelo
+/// tick de Livre-Arbítrio) pra ser entregue ao próximo jogador que estiver
+/// naquela `location_id` — ver Módulo 6 em Tarefas-Pendentes.
+pub async fn inserir_evento_ambiente_pendente(pool: &SqlitePool, location_id: &str, evento: &Event) -> anyhow::Result<()> {
+    let data = serde_json::to_string(evento)?;
+    sqlx::query("INSERT INTO eventos_ambiente_pendentes (location_id, evento) VALUES (?, ?)")
+        .bind(location_id)
+        .bind(data)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Devolve e marca como entregues todos os eventos ambiente pendentes de uma
+/// localização — cada evento é entregue exatamente uma vez, no primeiro
+/// `/turn` de qualquer jogador ali depois de gerado.
+pub async fn consumir_eventos_ambiente_pendentes(pool: &SqlitePool, location_id: &str) -> anyhow::Result<Vec<Event>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, evento FROM eventos_ambiente_pendentes WHERE location_id = ? AND entregue = 0 ORDER BY id ASC",
+    )
+    .bind(location_id)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("UPDATE eventos_ambiente_pendentes SET entregue = 1 WHERE id IN ({placeholders})");
+    let mut query = sqlx::query(&sql);
+    for id in &ids {
+        query = query.bind(id);
+    }
+    query.execute(pool).await?;
+
+    rows.into_iter().map(|(_, data)| serde_json::from_str(&data).map_err(Into::into)).collect()
 }
 
