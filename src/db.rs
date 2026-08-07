@@ -1,3 +1,4 @@
+use crate::events::Event;
 use crate::state::{Cena, Combate, MemoriaNpc, Npc, Player};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
@@ -70,6 +71,22 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<SqlitePool> {
         CREATE TABLE IF NOT EXISTS combates (
             player_id TEXT PRIMARY KEY,
             data TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // Histórico de eventos por jogador — persiste o chat entre reloads de
+    // página (ver Change-Chat-Screen: hoje é só estado de componente React,
+    // perdido ao recarregar). `evento` é o JSON serializado do Event inteiro.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS eventos_historico (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id TEXT NOT NULL,
+            turno INTEGER NOT NULL,
+            evento TEXT NOT NULL
         )
         "#,
     )
@@ -393,5 +410,39 @@ pub async fn reiniciar_mundo(pool: &SqlitePool) -> anyhow::Result<()> {
     }
     seed_se_vazio(pool).await?;
     Ok(())
+}
+
+/// Ver Change-Chat-Screen: persiste o lote de eventos de um turno para que o
+/// frontend possa reconstruir o histórico do chat ao recarregar a página.
+pub async fn registrar_eventos_historico(pool: &SqlitePool, player_id: &str, eventos: &[Event]) -> anyhow::Result<()> {
+    for evento in eventos {
+        let data = serde_json::to_string(evento)?;
+        sqlx::query("INSERT INTO eventos_historico (player_id, turno, evento) VALUES (?, ?, ?)")
+            .bind(player_id)
+            .bind(evento.turn as i64)
+            .bind(data)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Últimos `limite` eventos do jogador, do mais antigo para o mais novo (como
+/// o chat espera renderizar).
+pub async fn historico_do_jogador(pool: &SqlitePool, player_id: &str, limite: i64) -> anyhow::Result<Vec<Event>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT evento FROM eventos_historico WHERE player_id = ? ORDER BY id DESC LIMIT ?",
+    )
+    .bind(player_id)
+    .bind(limite)
+    .fetch_all(pool)
+    .await?;
+
+    let mut eventos: Vec<Event> = rows
+        .into_iter()
+        .map(|(data,)| serde_json::from_str(&data))
+        .collect::<Result<_, _>>()?;
+    eventos.reverse();
+    Ok(eventos)
 }
 
