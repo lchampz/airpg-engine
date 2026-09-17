@@ -225,7 +225,12 @@ async fn seed_configuracoes_llm_se_vazio(pool: &SqlitePool) -> anyhow::Result<()
         if get_configuracao_llm(pool, perfil).await?.is_none() {
             set_configuracao_llm(
                 pool,
-                &ConfiguracaoLlm { perfil: perfil.to_string(), model: "airpg-local".to_string(), api_base: None, api_key: None },
+                &ConfiguracaoLlm {
+                    perfil: perfil.to_string(),
+                    model: "airpg-local".to_string(),
+                    api_base: None,
+                    api_key: None,
+                },
             )
             .await?;
         }
@@ -233,19 +238,40 @@ async fn seed_configuracoes_llm_se_vazio(pool: &SqlitePool) -> anyhow::Result<()
     Ok(())
 }
 
-pub async fn get_configuracao_llm(pool: &SqlitePool, perfil: &str) -> anyhow::Result<Option<ConfiguracaoLlm>> {
-    let row: Option<(String, String, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT perfil, model, api_base, api_key FROM configuracoes_llm WHERE perfil = ?")
-            .bind(perfil)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.map(|(perfil, model, api_base, api_key)| ConfiguracaoLlm { perfil, model, api_base, api_key }))
+pub async fn get_configuracao_llm(
+    pool: &SqlitePool,
+    perfil: &str,
+) -> anyhow::Result<Option<ConfiguracaoLlm>> {
+    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT perfil, model, api_base, api_key FROM configuracoes_llm WHERE perfil = ?",
+    )
+    .bind(perfil)
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        row.map(|(perfil, model, api_base, api_key)| ConfiguracaoLlm {
+            perfil,
+            model,
+            api_base,
+            api_key,
+        }),
+    )
 }
 
 pub async fn list_configuracoes_llm(pool: &SqlitePool) -> anyhow::Result<Vec<ConfiguracaoLlm>> {
     let rows: Vec<(String, String, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT perfil, model, api_base, api_key FROM configuracoes_llm").fetch_all(pool).await?;
-    Ok(rows.into_iter().map(|(perfil, model, api_base, api_key)| ConfiguracaoLlm { perfil, model, api_base, api_key }).collect())
+        sqlx::query_as("SELECT perfil, model, api_base, api_key FROM configuracoes_llm")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(perfil, model, api_base, api_key)| ConfiguracaoLlm {
+            perfil,
+            model,
+            api_base,
+            api_key,
+        })
+        .collect())
 }
 
 /// `perfil` já deve ter sido validado contra `PERFIS_LLM_VALIDOS` por quem
@@ -308,7 +334,11 @@ pub struct AcaoGlobal {
     pub timestamp: String,
 }
 
-pub async fn listar_acoes_globais(pool: &SqlitePool, location_id: Option<&str>, limit: i64) -> anyhow::Result<Vec<AcaoGlobal>> {
+pub async fn listar_acoes_globais(
+    pool: &SqlitePool,
+    location_id: Option<&str>,
+    limit: i64,
+) -> anyhow::Result<Vec<AcaoGlobal>> {
     let rows: Vec<(i64, i64, String, String, String, String, String, String)> = match location_id {
         Some(loc) => {
             sqlx::query_as(
@@ -332,16 +362,27 @@ pub async fn listar_acoes_globais(pool: &SqlitePool, location_id: Option<&str>, 
     };
     Ok(rows
         .into_iter()
-        .map(|(id, turno_global, ator_id, ator_tipo, tipo_acao, descricao, location_id, timestamp)| AcaoGlobal {
-            id,
-            turno_global,
-            ator_id,
-            ator_tipo,
-            tipo_acao,
-            descricao,
-            location_id,
-            timestamp,
-        })
+        .map(
+            |(
+                id,
+                turno_global,
+                ator_id,
+                ator_tipo,
+                tipo_acao,
+                descricao,
+                location_id,
+                timestamp,
+            )| AcaoGlobal {
+                id,
+                turno_global,
+                ator_id,
+                ator_tipo,
+                tipo_acao,
+                descricao,
+                location_id,
+                timestamp,
+            },
+        )
         .collect())
 }
 
@@ -350,15 +391,16 @@ pub async fn listar_acoes_globais(pool: &SqlitePool, location_id: Option<&str>, 
 /// efêmera por natureza (ver Memoria-Narrativa) — recriar a tabela e perder
 /// memória antiga é aceitável, não há usuário real ainda.
 async fn migrar_npc_memoria(pool: &SqlitePool) -> anyhow::Result<()> {
-    let existe: Option<(String,)> = sqlx::query_as(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='npc_memoria'",
-    )
-    .fetch_optional(pool)
-    .await?;
+    let existe: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name='npc_memoria'")
+            .fetch_optional(pool)
+            .await?;
 
     if existe.is_some() {
         let colunas: Vec<(i64, String, String, i64, Option<String>, i64)> =
-            sqlx::query_as("PRAGMA table_info(npc_memoria)").fetch_all(pool).await?;
+            sqlx::query_as("PRAGMA table_info(npc_memoria)")
+                .fetch_all(pool)
+                .await?;
         let tem_player_id = colunas.iter().any(|(_, nome, ..)| nome == "player_id");
         if !tem_player_id {
             sqlx::query("DROP TABLE npc_memoria").execute(pool).await?;
@@ -372,7 +414,9 @@ async fn migrar_npc_memoria(pool: &SqlitePool) -> anyhow::Result<()> {
 /// ver Decisoes-Resolvidas) sem depender ainda de um fluxo de criação de
 /// campanha. Só popula se as tabelas estiverem vazias — não sobrescreve.
 async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM npcs").fetch_one(pool).await?;
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM npcs")
+        .fetch_one(pool)
+        .await?;
     if count.0 > 0 {
         // Tabela já populada de uma sessão anterior — ainda assim garante que
         // o combatente de exemplo exista, já que ele foi adicionado ao seed
@@ -388,7 +432,12 @@ async fn seed_se_vazio(pool: &SqlitePool) -> anyhow::Result<()> {
 
     upsert_player(pool, &Player::seed("player_01")).await?;
 
-    let npcs = vec![npc_taverneiro_bram_seed(), npc_cliente_gerta_seed(), npc_guarda_holt_seed(), npc_lobo_seed()];
+    let npcs = vec![
+        npc_taverneiro_bram_seed(),
+        npc_cliente_gerta_seed(),
+        npc_guarda_holt_seed(),
+        npc_lobo_seed(),
+    ];
     for npc in &npcs {
         upsert_npc(pool, npc).await?;
     }
@@ -416,6 +465,7 @@ fn npc_taverneiro_bram_seed() -> Npc {
         moedas: Some(50),
         precos: [("cerveja".to_string(), 5u32)].into_iter().collect(),
         interesses: vec!["precisa manter a taverna lucrativa — cobra tudo que vende, nunca dá de graça sem um motivo claro".into()],
+        temperamento_base: Default::default(),
     }
 }
 
@@ -439,6 +489,7 @@ fn npc_cliente_gerta_seed() -> Npc {
         moedas: None,
         precos: std::collections::HashMap::new(),
         interesses: vec!["adora fofoca sobre os outros hóspedes e os rumores do Porto Velho".into()],
+        temperamento_base: Default::default(),
     }
 }
 
@@ -462,6 +513,7 @@ fn npc_guarda_holt_seed() -> Npc {
         moedas: None,
         precos: std::collections::HashMap::new(),
         interesses: vec!["quer manter a floresta livre de intrusos perigosos".into()],
+        temperamento_base: Default::default(),
     }
 }
 
@@ -473,7 +525,11 @@ fn npc_guarda_holt_seed() -> Npc {
 /// eles. Só preenche o que ainda estiver vazio/`None` — não sobrescreve
 /// personalização feita por alguma sessão de jogo.
 async fn backfill_descricao_npcs_historia(pool: &SqlitePool) -> anyhow::Result<()> {
-    for seed in [npc_taverneiro_bram_seed(), npc_cliente_gerta_seed(), npc_guarda_holt_seed()] {
+    for seed in [
+        npc_taverneiro_bram_seed(),
+        npc_cliente_gerta_seed(),
+        npc_guarda_holt_seed(),
+    ] {
         if let Some(mut npc) = get_npc(pool, &seed.id).await? {
             let mut mudou = false;
             if npc.descricao.is_empty() {
@@ -522,6 +578,7 @@ fn npc_lobo_seed() -> Npc {
         moedas: None,
         precos: std::collections::HashMap::new(),
         interesses: vec![],
+        temperamento_base: Default::default(),
     }
 }
 
@@ -573,13 +630,21 @@ pub async fn get_npc(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<Npc>>
 }
 
 pub async fn list_npcs(pool: &SqlitePool) -> anyhow::Result<Vec<Npc>> {
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT data FROM npcs").fetch_all(pool).await?;
-    rows.into_iter().map(|(data,)| serde_json::from_str(&data).map_err(Into::into)).collect()
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT data FROM npcs")
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|(data,)| serde_json::from_str(&data).map_err(Into::into))
+        .collect()
 }
 
 /// Marca que `player_id` já encontrou `npc_id` (ver Change-Bestiario) — só
 /// jogadores que já descobriram uma criatura a veem no bestiário.
-pub async fn marcar_descoberto(pool: &SqlitePool, player_id: &str, npc_id: &str) -> anyhow::Result<()> {
+pub async fn marcar_descoberto(
+    pool: &SqlitePool,
+    player_id: &str,
+    npc_id: &str,
+) -> anyhow::Result<()> {
     sqlx::query("INSERT OR IGNORE INTO descobertas (player_id, npc_id) VALUES (?, ?)")
         .bind(player_id)
         .bind(npc_id)
@@ -588,7 +653,10 @@ pub async fn marcar_descoberto(pool: &SqlitePool, player_id: &str, npc_id: &str)
     Ok(())
 }
 
-pub async fn npcs_descobertos_por(pool: &SqlitePool, player_id: &str) -> anyhow::Result<Vec<String>> {
+pub async fn npcs_descobertos_por(
+    pool: &SqlitePool,
+    player_id: &str,
+) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as("SELECT npc_id FROM descobertas WHERE player_id = ?")
         .bind(player_id)
         .fetch_all(pool)
@@ -602,7 +670,11 @@ pub const MAX_TROCAS_MEMORIA: usize = 3;
 /// A cada quantos turnos a memória de um par (NPC, jogador) é consolidada.
 pub const TURNOS_POR_CONSOLIDACAO: u32 = 5;
 
-pub async fn get_memoria(pool: &SqlitePool, npc_id: &str, player_id: &str) -> anyhow::Result<MemoriaNpc> {
+pub async fn get_memoria(
+    pool: &SqlitePool,
+    npc_id: &str,
+    player_id: &str,
+) -> anyhow::Result<MemoriaNpc> {
     let row: Option<(String, String, String, i64)> = sqlx::query_as(
         "SELECT ctx, resumo, estado_emocional, turnos_desde_consolidacao FROM npc_memoria WHERE npc_id = ? AND player_id = ?",
     )
@@ -622,7 +694,12 @@ pub async fn get_memoria(pool: &SqlitePool, npc_id: &str, player_id: &str) -> an
     })
 }
 
-pub async fn salvar_memoria(pool: &SqlitePool, npc_id: &str, player_id: &str, memoria: &MemoriaNpc) -> anyhow::Result<()> {
+pub async fn salvar_memoria(
+    pool: &SqlitePool,
+    npc_id: &str,
+    player_id: &str,
+    memoria: &MemoriaNpc,
+) -> anyhow::Result<()> {
     let ctx = serde_json::to_string(&memoria.ctx)?;
     let estado = serde_json::to_string(&memoria.estado_emocional)?;
     sqlx::query(
@@ -692,7 +769,11 @@ pub const MAX_FATOS_POR_CENA: usize = 20;
 /// Adiciona um fato a uma Cena já existente — usado pela simulação de mundo
 /// em background do Mundo Vivo (Elixir). Só adiciona a cenas que já existem
 /// (não cria uma nova aqui — criação é sempre via `mestre::resolver_cena`).
-pub async fn adicionar_fato_a_cena(pool: &SqlitePool, location_id: &str, fato: &str) -> anyhow::Result<bool> {
+pub async fn adicionar_fato_a_cena(
+    pool: &SqlitePool,
+    location_id: &str,
+    fato: &str,
+) -> anyhow::Result<bool> {
     let Some(mut cena) = get_cena(pool, location_id).await? else {
         return Ok(false);
     };
@@ -725,7 +806,10 @@ pub async fn salvar_combate(pool: &SqlitePool, combate: &Combate) -> anyhow::Res
 }
 
 pub async fn encerrar_combate(pool: &SqlitePool, player_id: &str) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM combates WHERE player_id = ?").bind(player_id).execute(pool).await?;
+    sqlx::query("DELETE FROM combates WHERE player_id = ?")
+        .bind(player_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -733,17 +817,46 @@ pub async fn encerrar_combate(pool: &SqlitePool, player_id: &str) -> anyhow::Res
 /// especificamente. `npcs`/`cenas` (dados de mundo, compartilhados) não são
 /// tocados.
 pub async fn reiniciar_dados_do_jogador(pool: &SqlitePool, player_id: &str) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM players WHERE id = ?").bind(player_id).execute(pool).await?;
-    sqlx::query("DELETE FROM npc_memoria WHERE player_id = ?").bind(player_id).execute(pool).await?;
-    sqlx::query("DELETE FROM combates WHERE player_id = ?").bind(player_id).execute(pool).await?;
+    sqlx::query("DELETE FROM players WHERE id = ?")
+        .bind(player_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM npc_memoria WHERE player_id = ?")
+        .bind(player_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM combates WHERE player_id = ?")
+        .bind(player_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
 /// Ver Change-Fluxo-de-Morte — destrutivo para TODOS os jogadores da
 /// instância, não só quem pediu o reinício. Apaga tudo e roda o seed de novo.
+/// Apaga TODO estado de jogo/histórico pra recomeçar do zero — mantém só o
+/// que é configuração (`configuracoes_llm`) e dado estático não relacionado
+/// a uma partida (`regras_srd_chunks`, o índice do SRD pro RAG). Antes desta
+/// correção só limpava `players`/`npcs`/`npc_memoria`/`cenas`/`combates`,
+/// deixando `descobertas`/`eventos_historico`/`eventos_ambiente_pendentes`/
+/// `frases_recentes`/`acoes_globais` (Log Global) do jogo anterior
+/// vazando pro novo — achado real ao usar o botão de reinício.
 pub async fn reiniciar_mundo(pool: &SqlitePool) -> anyhow::Result<()> {
-    for tabela in ["players", "npcs", "npc_memoria", "cenas", "combates"] {
-        sqlx::query(&format!("DELETE FROM {tabela}")).execute(pool).await?;
+    for tabela in [
+        "players",
+        "npcs",
+        "npc_memoria",
+        "cenas",
+        "combates",
+        "descobertas",
+        "eventos_historico",
+        "eventos_ambiente_pendentes",
+        "frases_recentes",
+        "acoes_globais",
+    ] {
+        sqlx::query(&format!("DELETE FROM {tabela}"))
+            .execute(pool)
+            .await?;
     }
     seed_se_vazio(pool).await?;
     Ok(())
@@ -751,7 +864,11 @@ pub async fn reiniciar_mundo(pool: &SqlitePool) -> anyhow::Result<()> {
 
 /// Ver Change-Chat-Screen: persiste o lote de eventos de um turno para que o
 /// frontend possa reconstruir o histórico do chat ao recarregar a página.
-pub async fn registrar_eventos_historico(pool: &SqlitePool, player_id: &str, eventos: &[Event]) -> anyhow::Result<()> {
+pub async fn registrar_eventos_historico(
+    pool: &SqlitePool,
+    player_id: &str,
+    eventos: &[Event],
+) -> anyhow::Result<()> {
     for evento in eventos {
         let data = serde_json::to_string(evento)?;
         sqlx::query("INSERT INTO eventos_historico (player_id, turno, evento) VALUES (?, ?, ?)")
@@ -766,7 +883,11 @@ pub async fn registrar_eventos_historico(pool: &SqlitePool, player_id: &str, eve
 
 /// Últimos `limite` eventos do jogador, do mais antigo para o mais novo (como
 /// o chat espera renderizar).
-pub async fn historico_do_jogador(pool: &SqlitePool, player_id: &str, limite: i64) -> anyhow::Result<Vec<Event>> {
+pub async fn historico_do_jogador(
+    pool: &SqlitePool,
+    player_id: &str,
+    limite: i64,
+) -> anyhow::Result<Vec<Event>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT evento FROM eventos_historico WHERE player_id = ? ORDER BY id DESC LIMIT ?",
     )
@@ -786,7 +907,11 @@ pub async fn historico_do_jogador(pool: &SqlitePool, player_id: &str, limite: i6
 /// Enfileira um evento ambiente (ex: conversa entre dois NPCs gerada pelo
 /// tick de Livre-Arbítrio) pra ser entregue ao próximo jogador que estiver
 /// naquela `location_id` — ver Módulo 6 em Tarefas-Pendentes.
-pub async fn inserir_evento_ambiente_pendente(pool: &SqlitePool, location_id: &str, evento: &Event) -> anyhow::Result<()> {
+pub async fn inserir_evento_ambiente_pendente(
+    pool: &SqlitePool,
+    location_id: &str,
+    evento: &Event,
+) -> anyhow::Result<()> {
     let data = serde_json::to_string(evento)?;
     sqlx::query("INSERT INTO eventos_ambiente_pendentes (location_id, evento) VALUES (?, ?)")
         .bind(location_id)
@@ -799,7 +924,10 @@ pub async fn inserir_evento_ambiente_pendente(pool: &SqlitePool, location_id: &s
 /// Devolve e marca como entregues todos os eventos ambiente pendentes de uma
 /// localização — cada evento é entregue exatamente uma vez, no primeiro
 /// `/turn` de qualquer jogador ali depois de gerado.
-pub async fn consumir_eventos_ambiente_pendentes(pool: &SqlitePool, location_id: &str) -> anyhow::Result<Vec<Event>> {
+pub async fn consumir_eventos_ambiente_pendentes(
+    pool: &SqlitePool,
+    location_id: &str,
+) -> anyhow::Result<Vec<Event>> {
     let rows: Vec<(i64, String)> = sqlx::query_as(
         "SELECT id, evento FROM eventos_ambiente_pendentes WHERE location_id = ? AND entregue = 0 ORDER BY id ASC",
     )
@@ -813,14 +941,17 @@ pub async fn consumir_eventos_ambiente_pendentes(pool: &SqlitePool, location_id:
 
     let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!("UPDATE eventos_ambiente_pendentes SET entregue = 1 WHERE id IN ({placeholders})");
+    let sql =
+        format!("UPDATE eventos_ambiente_pendentes SET entregue = 1 WHERE id IN ({placeholders})");
     let mut query = sqlx::query(&sql);
     for id in &ids {
         query = query.bind(id);
     }
     query.execute(pool).await?;
 
-    rows.into_iter().map(|(_, data)| serde_json::from_str(&data).map_err(Into::into)).collect()
+    rows.into_iter()
+        .map(|(_, data)| serde_json::from_str(&data).map_err(Into::into))
+        .collect()
 }
 
 /// Normaliza pra comparação de similaridade: minúsculas, só letras/números/
@@ -831,7 +962,13 @@ fn normalizar_frase(texto: &str) -> String {
     texto
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -860,7 +997,11 @@ const JANELA_FRASES_RECENTES: i64 = 10;
 /// Ver Change-Economia-Viva-e-Consistencia: compara `texto` contra as
 /// últimas falas da mesma localização. Retorna a frase antiga colidida, se
 /// houver, pra o chamador decidir pedir uma nova geração ao LLM.
-pub async fn frase_repetida(pool: &SqlitePool, location_id: &str, texto: &str) -> anyhow::Result<Option<String>> {
+pub async fn frase_repetida(
+    pool: &SqlitePool,
+    location_id: &str,
+    texto: &str,
+) -> anyhow::Result<Option<String>> {
     let normalizado = normalizar_frase(texto);
     let candidatos: Vec<(String,)> = sqlx::query_as(
         "SELECT texto_normalizado FROM frases_recentes WHERE location_id = ? ORDER BY id DESC LIMIT ?",
@@ -870,20 +1011,29 @@ pub async fn frase_repetida(pool: &SqlitePool, location_id: &str, texto: &str) -
     .fetch_all(pool)
     .await?;
 
-    Ok(candidatos.into_iter().find(|(antigo,)| similaridade_jaccard(&normalizado, antigo) >= LIMIAR_REPETICAO).map(|(antigo,)| antigo))
+    Ok(candidatos
+        .into_iter()
+        .find(|(antigo,)| similaridade_jaccard(&normalizado, antigo) >= LIMIAR_REPETICAO)
+        .map(|(antigo,)| antigo))
 }
 
 /// Registra `texto` como dito em `location_id` e poda pra manter só as
 /// últimas `JANELA_FRASES_RECENTES * 5` entradas por localização — margem
 /// maior que a janela de comparação, só pra não crescer sem limite.
-pub async fn registrar_frase_recente(pool: &SqlitePool, location_id: &str, texto: &str) -> anyhow::Result<()> {
+pub async fn registrar_frase_recente(
+    pool: &SqlitePool,
+    location_id: &str,
+    texto: &str,
+) -> anyhow::Result<()> {
     let normalizado = normalizar_frase(texto);
-    sqlx::query("INSERT INTO frases_recentes (location_id, texto_normalizado, timestamp) VALUES (?, ?, ?)")
-        .bind(location_id)
-        .bind(&normalizado)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO frases_recentes (location_id, texto_normalizado, timestamp) VALUES (?, ?, ?)",
+    )
+    .bind(location_id)
+    .bind(&normalizado)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
 
     let manter = JANELA_FRASES_RECENTES * 5;
     sqlx::query(
@@ -899,14 +1049,16 @@ pub async fn registrar_frase_recente(pool: &SqlitePool, location_id: &str, texto
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests_anti_repeticao {
     use super::*;
 
     #[test]
     fn normaliza_removendo_pontuacao_e_caixa() {
-        assert_eq!(normalizar_frase("Bem-vindo, VIAJANTE!!"), "bem vindo viajante");
+        assert_eq!(
+            normalizar_frase("Bem-vindo, VIAJANTE!!"),
+            "bem vindo viajante"
+        );
     }
 
     #[test]

@@ -24,7 +24,12 @@ fn agora() -> DateTime<Utc> {
 }
 
 impl Event {
-    pub fn new(event_type: EventType, source: impl Into<String>, turn: u64, payload: serde_json::Value) -> Self {
+    pub fn new(
+        event_type: EventType,
+        source: impl Into<String>,
+        turn: u64,
+        payload: serde_json::Value,
+    ) -> Self {
         Self {
             event_id: Uuid::new_v4(),
             event_type,

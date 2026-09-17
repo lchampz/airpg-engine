@@ -185,7 +185,33 @@ fn montar_system_prompt(
     )];
 
     if !npc.interesses.is_empty() {
-        partes.push(format!("Suas motivações/necessidades concretas: {}.", npc.interesses.join("; ")));
+        partes.push(format!(
+            "Suas motivações/necessidades concretas: {}.",
+            npc.interesses.join("; ")
+        ));
+    }
+
+    // Ver Change-Temperamento-Evolutivo: humor/estresse de base, evolui com
+    // o tempo via livre_arbitrio::tick — só entra no prompt quando sai do
+    // neutro, pra não poluir toda interação com "seu humor é 0.0".
+    let t = &npc.temperamento_base;
+    if t.humor.abs() > 0.15 || t.estresse > 0.15 || !t.tags.is_empty() {
+        let humor_desc = if t.humor > 0.3 {
+            "de bom humor hoje"
+        } else if t.humor < -0.3 {
+            "de mau humor hoje"
+        } else {
+            "num humor neutro hoje"
+        };
+        let estresse_desc = if t.estresse > 0.3 {
+            ", visivelmente estressado"
+        } else {
+            ""
+        };
+        partes.push(format!(
+            "Seu temperamento de base (independente de com quem você fala): você está {humor_desc}{estresse_desc}.{}",
+            if t.tags.is_empty() { String::new() } else { format!(" Preocupações/sentimentos atuais: {}.", t.tags.join("; ")) }
+        ));
     }
 
     partes.push(format!(
@@ -200,7 +226,8 @@ fn montar_system_prompt(
     ));
 
     let e = &memoria.estado_emocional;
-    let emocional_relevante = e.prazer.abs() > 0.1 || e.ativacao.abs() > 0.1 || e.dominancia.abs() > 0.1;
+    let emocional_relevante =
+        e.prazer.abs() > 0.1 || e.ativacao.abs() > 0.1 || e.dominancia.abs() > 0.1;
     if emocional_relevante {
         partes.push(format!(
             "Seu estado emocional atual em relação a este jogador: prazer={:.1}, ativação={:.1}, dominância={:.1}, confiança={:.1}, respeito={:.1}, afinidade={:.1}. {}{}",
@@ -211,7 +238,10 @@ fn montar_system_prompt(
     }
 
     if !memoria.resumo.is_empty() {
-        partes.push(format!("Resumo do que já aconteceu entre vocês: {}", memoria.resumo));
+        partes.push(format!(
+            "Resumo do que já aconteceu entre vocês: {}",
+            memoria.resumo
+        ));
     }
 
     if let Some(r) = resultado_dados {

@@ -68,7 +68,10 @@ pub async fn consolidar(
         }
     };
 
-    Some(ResultadoConsolidacao { resumo: gerada.resumo, estado_emocional: limitar_bounds(gerada.estado_emocional) })
+    Some(ResultadoConsolidacao {
+        resumo: gerada.resumo,
+        estado_emocional: limitar_bounds(gerada.estado_emocional),
+    })
 }
 
 /// Só os eixos numéricos são limitados — são os únicos usados por decisão de
@@ -91,7 +94,17 @@ mod tests {
 
     #[test]
     fn limita_eixos_fora_do_intervalo() {
-        let e = EstadoEmocional { prazer: 5.0, ativacao: -5.0, dominancia: 2.0, confianca: -2.0, respeito: 0.5, afinidade: 0.0, tags: vec![], lente_perceptiva: String::new(), motivacao_imediata: String::new() };
+        let e = EstadoEmocional {
+            prazer: 5.0,
+            ativacao: -5.0,
+            dominancia: 2.0,
+            confianca: -2.0,
+            respeito: 0.5,
+            afinidade: 0.0,
+            tags: vec![],
+            lente_perceptiva: String::new(),
+            motivacao_imediata: String::new(),
+        };
         let limitado = limitar_bounds(e);
         assert_eq!(limitado.prazer, 1.0);
         assert_eq!(limitado.ativacao, -1.0);
@@ -101,7 +114,17 @@ mod tests {
 
     #[test]
     fn limita_quantidade_de_tags() {
-        let e = EstadoEmocional { tags: vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into(), "f".into()], ..Default::default() };
+        let e = EstadoEmocional {
+            tags: vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "d".into(),
+                "e".into(),
+                "f".into(),
+            ],
+            ..Default::default()
+        };
         let limitado = limitar_bounds(e);
         assert_eq!(limitado.tags.len(), 5);
     }

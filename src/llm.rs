@@ -44,8 +44,10 @@ impl LlmClient {
     pub fn from_env() -> Self {
         Self {
             http: reqwest::Client::new(),
-            base_url: std::env::var("LITELLM_URL").unwrap_or_else(|_| "http://localhost:4000".into()),
-            api_key: std::env::var("LITELLM_API_KEY").unwrap_or_else(|_| "sk-airpg-local-dev".into()),
+            base_url: std::env::var("LITELLM_URL")
+                .unwrap_or_else(|_| "http://localhost:4000".into()),
+            api_key: std::env::var("LITELLM_API_KEY")
+                .unwrap_or_else(|_| "sk-airpg-local-dev".into()),
             model: std::env::var("LITELLM_MODEL").unwrap_or_else(|_| "airpg-local".into()),
         }
     }
@@ -55,7 +57,12 @@ impl LlmClient {
     /// (barato, geopolítica/tick autônomo) e "personagens" (pode ser mais
     /// caro, geração sob demanda). `None` mantém o valor atual do cliente
     /// base (ou seja, o padrão do ambiente).
-    pub fn with_config(&self, model: impl Into<String>, api_base: Option<String>, api_key: Option<String>) -> Self {
+    pub fn with_config(
+        &self,
+        model: impl Into<String>,
+        api_base: Option<String>,
+        api_key: Option<String>,
+    ) -> Self {
         Self {
             http: self.http.clone(),
             base_url: api_base.unwrap_or_else(|| self.base_url.clone()),
@@ -78,14 +85,30 @@ impl LlmClient {
         historico: &[(String, String)],
         user: &str,
     ) -> anyhow::Result<String> {
-        let mut messages = vec![ChatMessage { role: "system", content: system }];
+        let mut messages = vec![ChatMessage {
+            role: "system",
+            content: system,
+        }];
         for (prompt, resposta) in historico {
-            messages.push(ChatMessage { role: "user", content: prompt });
-            messages.push(ChatMessage { role: "assistant", content: resposta });
+            messages.push(ChatMessage {
+                role: "user",
+                content: prompt,
+            });
+            messages.push(ChatMessage {
+                role: "assistant",
+                content: resposta,
+            });
         }
-        messages.push(ChatMessage { role: "user", content: user });
+        messages.push(ChatMessage {
+            role: "user",
+            content: user,
+        });
 
-        let req = ChatRequest { model: &self.model, messages, temperature: 0.7 };
+        let req = ChatRequest {
+            model: &self.model,
+            messages,
+            temperature: 0.7,
+        };
 
         let resp = self
             .http

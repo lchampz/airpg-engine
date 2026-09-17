@@ -13,7 +13,11 @@ impl Orchestrator {
     /// Guardrail de Entrada simplificado: valida se a ação é mecanicamente possível.
     /// Implementação real deve consultar o Estado Rígido (SQLite) — aqui, checagem mínima
     /// de exemplo para manter o esqueleto compilável e testável.
-    pub fn validar_acao(&self, player: &Player, acao: &AcaoJogadorPayload) -> Result<(), AcaoRejeitadaPayload> {
+    pub fn validar_acao(
+        &self,
+        player: &Player,
+        acao: &AcaoJogadorPayload,
+    ) -> Result<(), AcaoRejeitadaPayload> {
         if acao.response.trim().is_empty() {
             return Err(AcaoRejeitadaPayload {
                 motivo: "acao_vazia".into(),
@@ -64,7 +68,10 @@ mod tests {
     fn jogador() -> Player {
         Player {
             id: "player_01".into(),
-            hp: Hp { atual: 10, maximo: 10 },
+            hp: Hp {
+                atual: 10,
+                maximo: 10,
+            },
             atributos: HashMap::new(),
             inventario: vec![],
             location_id: "taverna".into(),
@@ -80,7 +87,10 @@ mod tests {
     fn rejeita_acao_vazia() {
         let orch = Orchestrator;
         let p = jogador();
-        let acao = AcaoJogadorPayload { situation: "".into(), response: "".into() };
+        let acao = AcaoJogadorPayload {
+            situation: "".into(),
+            response: "".into(),
+        };
         assert!(orch.validar_acao(&p, &acao).is_err());
     }
 
@@ -94,7 +104,11 @@ mod tests {
                 nome: format!("NPC {i}"),
                 status: NpcStatus::Vivo,
                 atitude_com_jogador: "neutro".into(),
-                location_id: if i % 2 == 0 { "taverna".into() } else { "floresta".into() },
+                location_id: if i % 2 == 0 {
+                    "taverna".into()
+                } else {
+                    "floresta".into()
+                },
                 autonomo: false,
                 hp: None,
                 classe_armadura: None,
@@ -108,6 +122,7 @@ mod tests {
                 moedas: None,
                 precos: Default::default(),
                 interesses: vec![],
+                temperamento_base: Default::default(),
             })
             .collect();
         let roteados = orch.rotear_agentes(&p, &npcs);

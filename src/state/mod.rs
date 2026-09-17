@@ -62,8 +62,14 @@ pub const PLAYER_CA_PADRAO: u32 = 10;
 /// UI (ficha do personagem) para saber quais atributos desenhar, já que o
 /// mapa em si permanece um `HashMap<String, i32>` livre no modelo
 /// (ver Change-Ficha-Personagem).
-pub const ATRIBUTOS_PADRAO: &[&str] =
-    &["forca", "destreza", "constituicao", "inteligencia", "sabedoria", "carisma"];
+pub const ATRIBUTOS_PADRAO: &[&str] = &[
+    "forca",
+    "destreza",
+    "constituicao",
+    "inteligencia",
+    "sabedoria",
+    "carisma",
+];
 
 pub fn nivel_por_xp(xp: u32) -> u32 {
     LIMIARES_XP.iter().filter(|&&limiar| xp >= limiar).count() as u32
@@ -76,8 +82,14 @@ impl Player {
     pub fn seed(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
-            hp: Hp { atual: 10, maximo: 10 },
-            atributos: ATRIBUTOS_PADRAO.iter().map(|&chave| (chave.to_string(), 10)).collect(),
+            hp: Hp {
+                atual: 10,
+                maximo: 10,
+            },
+            atributos: ATRIBUTOS_PADRAO
+                .iter()
+                .map(|&chave| (chave.to_string(), 10))
+                .collect(),
             inventario: vec![],
             location_id: "taverna_porto_velho".into(),
             nivel: 1,
@@ -148,6 +160,38 @@ pub struct Npc {
     /// Change-Economia-Viva-e-Consistencia).
     #[serde(default)]
     pub interesses: Vec<String>,
+    /// Ver Change-Temperamento-Evolutivo (Fase 2 de Economia Viva): humor/
+    /// estresse de base, global (não por jogador — diferente de
+    /// `EstadoEmocional`, que é por par NPC×jogador). Evolui lentamente via
+    /// `livre_arbitrio::tick`, nunca é setado direto pelo LLM de diálogo.
+    #[serde(default)]
+    pub temperamento_base: Temperamento,
+}
+
+/// Humor/estresse de base de um NPC, independente de com quem ele está
+/// falando — dá uma "primeira impressão" que varia com o tempo mesmo pra
+/// jogadores que nunca interagiram com aquele NPC antes. Ver
+/// Change-Temperamento-Evolutivo.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Temperamento {
+    /// -1.0 (péssimo) a 1.0 (ótimo).
+    #[serde(default)]
+    pub humor: f32,
+    /// 0.0 a 1.0.
+    #[serde(default)]
+    pub estresse: f32,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+impl Default for Temperamento {
+    fn default() -> Self {
+        Self {
+            humor: 0.0,
+            estresse: 0.0,
+            tags: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

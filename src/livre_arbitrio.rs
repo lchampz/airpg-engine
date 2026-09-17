@@ -47,7 +47,12 @@ struct FalaProposta {
 /// `orchestrator::rotear_agentes`), sorteia um deles como ator, e decide (via
 /// LLM, perfil de custo "mundo") o que ele faz agora. Fire-and-forget: quem
 /// chama (`main.rs::processar_turno`) não espera isso terminar.
-pub async fn tick(pool: SqlitePool, llm: LlmClient, guardrail: std::sync::Arc<GuardrailSaida>, turno_global: u64) {
+pub async fn tick(
+    pool: SqlitePool,
+    llm: LlmClient,
+    guardrail: std::sync::Arc<GuardrailSaida>,
+    turno_global: u64,
+) {
     let npcs = match db::list_npcs(&pool).await {
         Ok(n) => n,
         Err(err) => {
@@ -57,8 +62,14 @@ pub async fn tick(pool: SqlitePool, llm: LlmClient, guardrail: std::sync::Arc<Gu
     };
 
     let mut por_local: HashMap<String, Vec<Npc>> = HashMap::new();
-    for npc in npcs.into_iter().filter(|n| n.autonomo && n.status != NpcStatus::Morto && n.hp.is_none()) {
-        por_local.entry(npc.location_id.clone()).or_default().push(npc);
+    for npc in npcs
+        .into_iter()
+        .filter(|n| n.autonomo && n.status != NpcStatus::Morto && n.hp.is_none())
+    {
+        por_local
+            .entry(npc.location_id.clone())
+            .or_default()
+            .push(npc);
     }
 
     let locais: Vec<&String> = por_local.keys().collect();
@@ -74,12 +85,19 @@ pub async fn tick(pool: SqlitePool, llm: LlmClient, guardrail: std::sync::Arc<Gu
     let lista = candidatos
         .iter()
         .map(|n| {
-            let papel = if n.descricao.is_empty() { "sem papel definido" } else { &n.descricao };
+            let papel = if n.descricao.is_empty() {
+                "sem papel definido"
+            } else {
+                &n.descricao
+            };
             format!("{} (id: {}, papel: {})", n.nome, n.id, papel)
         })
         .collect::<Vec<_>>()
         .join("; ");
-    let entrada = format!("Personagem agindo: {} (id: {})\nOutros presentes em {}: {}", ator.nome, ator.id, location_id, lista);
+    let entrada = format!(
+        "Personagem agindo: {} (id: {})\nOutros presentes em {}: {}",
+        ator.nome, ator.id, location_id, lista
+    );
 
     let proposta = match llm.complete(SYSTEM_PROMPT_ACAO_AUTONOMA, &entrada).await {
         Ok(resposta) => extrair_json::<AcaoAutonomaProposta>(&resposta),
@@ -92,24 +110,171 @@ pub async fn tick(pool: SqlitePool, llm: LlmClient, guardrail: std::sync::Arc<Gu
     let Some(proposta) = proposta else { return };
     let timestamp = chrono::Utc::now().to_rfc3339();
 
-    if proposta.tipo == "conversar" {
-        let participante_b = candidatos.iter().find(|n| n.id == proposta.participante_b_id && n.id != ator.id);
+    let conversou = if proposta.tipo == "conversar" {
+        let participante_b = candidatos
+            .iter()
+            .find(|n| n.id == proposta.participante_b_id && n.id != ator.id);
         match participante_b {
-            Some(b) => gerar_conversa(&pool, &llm, &guardrail, ator, b, &location_id, turno_global, &timestamp).await,
+            Some(b) => {
+                gerar_conversa(
+                    &pool,
+                    &llm,
+                    &guardrail,
+                    ator,
+                    b,
+                    &location_id,
+                    turno_global,
+                    &timestamp,
+                )
+                .await;
+                true
+            }
             // LLM propôs conversar mas não deu um participante_b_id válido —
             // mesmo princípio defensivo de mestre::avaliar_destinatarios: não
             // inventa participante, cai pra registrar como ambiente.
-            None => registrar_ambiente(&pool, turno_global, ator, &location_id, "ambiente", &proposta.detalhe, &timestamp).await,
+            None => {
+                registrar_ambiente(
+                    &pool,
+                    turno_global,
+                    ator,
+                    &location_id,
+                    "ambiente",
+                    &proposta.detalhe,
+                    &timestamp,
+                )
+                .await;
+                false
+            }
         }
     } else {
-        registrar_ambiente(&pool, turno_global, ator, &location_id, &proposta.tipo, &proposta.detalhe, &timestamp).await;
+        registrar_ambiente(
+            &pool,
+            turno_global,
+            ator,
+            &location_id,
+            &proposta.tipo,
+            &proposta.detalhe,
+            &timestamp,
+        )
+        .await;
+        false
+    };
+
+    // Ver Change-Temperamento-Evolutivo: Camada 1 (barata, sempre) ajusta
+    // humor/estresse; Camada 2 (rara, via LLM) atualiza as tags qualitativas.
+    atualizar_temperamento(&pool, ator, conversou).await;
+    if turno_global % CADENCIA_REFLEXAO_TEMPERAMENTO == 0 {
+        refletir_temperamento(&pool, &llm, ator).await;
     }
 }
 
-async fn registrar_ambiente(pool: &SqlitePool, turno_global: u64, ator: &Npc, location_id: &str, tipo_acao: &str, detalhe: &str, timestamp: &str) {
-    let descricao = if detalhe.trim().is_empty() { format!("{} fez algo em {}", ator.nome, location_id) } else { detalhe.to_string() };
-    if let Err(err) =
-        db::registrar_acao_global(pool, turno_global as i64, &ator.id, "npc", tipo_acao, &descricao, location_id, timestamp).await
+/// Decaimento e impulso do humor/estresse de base — determinístico, nunca
+/// chama LLM. Decai sempre em direção a 0 (sem sinal novo, o NPC volta ao
+/// neutro), e recebe um pequeno empurrão positivo quando o tick resultou em
+/// interação social de verdade.
+const DECAIMENTO_TEMPERAMENTO: f32 = 0.02;
+const IMPULSO_CONVERSA: f32 = 0.05;
+/// A cada quantos ticks a Camada 2 (reflexão via LLM, mais cara) roda —
+/// valor conservador de propósito, ver Estrategia-Custo-Tokens.
+const CADENCIA_REFLEXAO_TEMPERAMENTO: u64 = 50;
+
+async fn atualizar_temperamento(pool: &SqlitePool, ator: &Npc, conversou: bool) {
+    let mut npc = match db::get_npc(pool, &ator.id).await {
+        Ok(Some(n)) => n,
+        _ => return,
+    };
+    let t = &mut npc.temperamento_base;
+    t.humor = decair(t.humor);
+    t.estresse = decair(t.estresse);
+    if conversou {
+        t.humor = (t.humor + IMPULSO_CONVERSA).clamp(-1.0, 1.0);
+    }
+    if let Err(err) = db::upsert_npc(pool, &npc).await {
+        tracing::warn!(%err, npc_id = %ator.id, "livre-arbitrio: falha ao persistir temperamento");
+    }
+}
+
+fn decair(valor: f32) -> f32 {
+    if valor.abs() < DECAIMENTO_TEMPERAMENTO {
+        0.0
+    } else {
+        valor - valor.signum() * DECAIMENTO_TEMPERAMENTO
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReflexaoProposta {
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// Camada 2: raramente, pede ao próprio NPC uma reflexão curta sobre como
+/// ele tem se sentido — é isso que dá variedade qualitativa (frases
+/// específicas), não só um número subindo/descendo. Perfil "mundo" (mesmo
+/// da Camada 1... na verdade só esta chama LLM).
+async fn refletir_temperamento(pool: &SqlitePool, llm: &LlmClient, ator: &Npc) {
+    let papel = if ator.descricao.is_empty() {
+        "sem papel definido"
+    } else {
+        &ator.descricao
+    };
+    let system = format!(
+        "Você é {}, um NPC de RPG de fantasia medieval refletindo brevemente sobre como tem se sentido ultimamente, dado seu papel: {}.\n\
+         Responda APENAS com um JSON no formato {{\"tags\": [\"sentimento ou preocupação atual\"]}}. No máximo 2 tags curtas e específicas, nunca genéricas como \"está bem\".",
+        ator.nome, papel,
+    );
+
+    let resposta = match llm
+        .complete(&system, "Reflita agora sobre seu estado atual.")
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(%err, npc_id = %ator.id, "livre-arbitrio: falha na reflexao de temperamento");
+            return;
+        }
+    };
+
+    let Some(proposta) = extrair_json::<ReflexaoProposta>(&resposta) else {
+        return;
+    };
+
+    let mut npc = match db::get_npc(pool, &ator.id).await {
+        Ok(Some(n)) => n,
+        _ => return,
+    };
+    npc.temperamento_base.tags = proposta.tags.into_iter().take(2).collect();
+    tracing::info!(npc_id = %ator.id, tags = ?npc.temperamento_base.tags, "livre-arbitrio: temperamento refletido");
+    if let Err(err) = db::upsert_npc(pool, &npc).await {
+        tracing::warn!(%err, npc_id = %ator.id, "livre-arbitrio: falha ao persistir tags de temperamento");
+    }
+}
+
+async fn registrar_ambiente(
+    pool: &SqlitePool,
+    turno_global: u64,
+    ator: &Npc,
+    location_id: &str,
+    tipo_acao: &str,
+    detalhe: &str,
+    timestamp: &str,
+) {
+    let descricao = if detalhe.trim().is_empty() {
+        format!("{} fez algo em {}", ator.nome, location_id)
+    } else {
+        detalhe.to_string()
+    };
+    if let Err(err) = db::registrar_acao_global(
+        pool,
+        turno_global as i64,
+        &ator.id,
+        "npc",
+        tipo_acao,
+        &descricao,
+        location_id,
+        timestamp,
+    )
+    .await
     {
         tracing::warn!(%err, "livre-arbitrio: falha ao registrar acao no log global");
     }
@@ -129,10 +294,26 @@ async fn gerar_conversa(
     turno_global: u64,
     timestamp: &str,
 ) {
-    let descricao_a = if a.descricao.is_empty() { "sem descricao".to_string() } else { a.descricao.clone() };
-    let descricao_b = if b.descricao.is_empty() { "sem descricao".to_string() } else { b.descricao.clone() };
-    let interesses_a = if a.interesses.is_empty() { String::new() } else { format!(" Motivações: {}.", a.interesses.join("; ")) };
-    let interesses_b = if b.interesses.is_empty() { String::new() } else { format!(" Motivações: {}.", b.interesses.join("; ")) };
+    let descricao_a = if a.descricao.is_empty() {
+        "sem descricao".to_string()
+    } else {
+        a.descricao.clone()
+    };
+    let descricao_b = if b.descricao.is_empty() {
+        "sem descricao".to_string()
+    } else {
+        b.descricao.clone()
+    };
+    let interesses_a = if a.interesses.is_empty() {
+        String::new()
+    } else {
+        format!(" Motivações: {}.", a.interesses.join("; "))
+    };
+    let interesses_b = if b.interesses.is_empty() {
+        String::new()
+    } else {
+        format!(" Motivações: {}.", b.interesses.join("; "))
+    };
     let system = format!(
         "Você está narrando uma conversa breve e natural entre dois personagens de um RPG de fantasia medieval, sem o jogador presente.\n\
          {} (id: {}) — {}{}\n{} (id: {}) — {}{}\n\
@@ -181,14 +362,27 @@ async fn gerar_conversa(
             tracing::warn!(%err, "livre-arbitrio: falha ao registrar frase recente");
         }
 
-        if let Err(err) =
-            db::registrar_acao_global(pool, turno_global as i64, &fala.npc_id, "npc", "conversa_ambiente", &texto_revisado, location_id, timestamp)
-                .await
+        if let Err(err) = db::registrar_acao_global(
+            pool,
+            turno_global as i64,
+            &fala.npc_id,
+            "npc",
+            "conversa_ambiente",
+            &texto_revisado,
+            location_id,
+            timestamp,
+        )
+        .await
         {
             tracing::warn!(%err, "livre-arbitrio: falha ao registrar fala no log global");
         }
 
-        let evento = Event::new(EventType::Dialogo, fala.npc_id.clone(), turno_global, serde_json::json!({ "texto": texto_revisado }));
+        let evento = Event::new(
+            EventType::Dialogo,
+            fala.npc_id.clone(),
+            turno_global,
+            serde_json::json!({ "texto": texto_revisado }),
+        );
         if let Err(err) = db::inserir_evento_ambiente_pendente(pool, location_id, &evento).await {
             tracing::warn!(%err, "livre-arbitrio: falha ao enfileirar evento ambiente");
         }

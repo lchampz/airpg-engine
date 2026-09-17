@@ -78,6 +78,7 @@ pub async fn gerar_personagem(llm: &LlmClient, location_id: &str, contexto: &str
         moedas: None,
         precos: std::collections::HashMap::new(),
         interesses: proposta.interesses,
+        temperamento_base: Default::default(),
     })
 }
 

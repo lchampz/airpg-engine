@@ -44,7 +44,11 @@ impl GuardrailSaida {
     /// caso reprovado nas MAX_TENTATIVAS tentativas). `resultado_dados`, se
     /// presente, é o resultado (já rolado, já determinístico) que a narração
     /// não pode contradizer.
-    pub async fn revisar(&self, texto_gerado: &str, resultado_dados: Option<&ResultadoDados>) -> String {
+    pub async fn revisar(
+        &self,
+        texto_gerado: &str,
+        resultado_dados: Option<&ResultadoDados>,
+    ) -> String {
         let system = montar_system_prompt(resultado_dados);
 
         for tentativa in 1..=MAX_TENTATIVAS {
@@ -67,7 +71,8 @@ impl GuardrailSaida {
             }
         }
 
-        "*O narrador hesita por um momento, incapaz de descrever o que aconteceu com clareza.*".to_string()
+        "*O narrador hesita por um momento, incapaz de descrever o que aconteceu com clareza.*"
+            .to_string()
     }
 }
 

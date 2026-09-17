@@ -61,9 +61,15 @@ pub async fn propor_mudancas(llm: &LlmClient, contexto: &str) -> Vec<MudancaProp
 /// nunca aplicamos a proposta original inconsistente, e nunca inventamos a
 /// correção no código (decisão do usuário: "o mestre de jogo reescreve a
 /// cena", não um desconto silencioso).
-pub async fn propor_e_validar(llm: &LlmClient, contexto: &str, npcs_presentes: &[&Npc]) -> Vec<MudancaProposta> {
-    let precos_conhecidos: HashMap<&str, u32> =
-        npcs_presentes.iter().flat_map(|n| n.precos.iter().map(|(item, preco)| (item.as_str(), *preco))).collect();
+pub async fn propor_e_validar(
+    llm: &LlmClient,
+    contexto: &str,
+    npcs_presentes: &[&Npc],
+) -> Vec<MudancaProposta> {
+    let precos_conhecidos: HashMap<&str, u32> = npcs_presentes
+        .iter()
+        .flat_map(|n| n.precos.iter().map(|(item, preco)| (item.as_str(), *preco)))
+        .collect();
 
     let propostas = propor_mudancas(llm, contexto).await;
     if precos_conhecidos.is_empty() {
@@ -80,11 +86,17 @@ pub async fn propor_e_validar(llm: &LlmClient, contexto: &str, npcs_presentes: &
             return None;
         }
         let item = p.valor.as_str()?;
-        precos_conhecidos.get(item).map(|&preco| (item.to_string(), preco))
+        precos_conhecidos
+            .get(item)
+            .map(|&preco| (item.to_string(), preco))
     });
 
     if let Some((item, preco)) = &item_com_preco_sem_pagamento {
-        let vendedor = npcs_presentes.iter().find(|n| n.precos.contains_key(item)).map(|n| n.nome.as_str()).unwrap_or("o vendedor");
+        let vendedor = npcs_presentes
+            .iter()
+            .find(|n| n.precos.contains_key(item))
+            .map(|n| n.nome.as_str())
+            .unwrap_or("o vendedor");
         match moeda_proposta_valor {
             None => {
                 let entrada_corrigida = format!(
@@ -117,13 +129,22 @@ pub async fn propor_e_validar(llm: &LlmClient, contexto: &str, npcs_presentes: &
     let valor_pago = moeda_proposta_valor.filter(|v| *v < 0).map(|v| (-v) as u32);
 
     if let Some(preco_pago) = valor_pago {
-        let item_correspondente = precos_conhecidos.iter().find(|(_, &preco)| preco == preco_pago).map(|(&item, _)| item);
+        let item_correspondente = precos_conhecidos
+            .iter()
+            .find(|(_, &preco)| preco == preco_pago)
+            .map(|(&item, _)| item);
         if let Some(item) = item_correspondente {
-            let ja_ganha_este_item = propostas
-                .iter()
-                .any(|p| p.campo == "player.inventario" && p.operacao == "adicionar" && p.valor.as_str() == Some(item));
+            let ja_ganha_este_item = propostas.iter().any(|p| {
+                p.campo == "player.inventario"
+                    && p.operacao == "adicionar"
+                    && p.valor.as_str() == Some(item)
+            });
             if !ja_ganha_este_item {
-                let vendedor = npcs_presentes.iter().find(|n| n.precos.get(item) == Some(&preco_pago)).map(|n| n.nome.as_str()).unwrap_or("o vendedor");
+                let vendedor = npcs_presentes
+                    .iter()
+                    .find(|n| n.precos.get(item) == Some(&preco_pago))
+                    .map(|n| n.nome.as_str())
+                    .unwrap_or("o vendedor");
                 let entrada_corrigida = format!(
                     "{contexto}\n\nATENÇÃO: você propôs debitar {preco_pago} moedas do jogador — valor que corresponde exatamente ao preço de \"{item}\" \
                      cobrado por {vendedor} — mas não incluiu a proposta de adicionar \"{item}\" ao inventário do jogador. Reescreva a lista de mudanças \
@@ -142,7 +163,11 @@ pub async fn propor_e_validar(llm: &LlmClient, contexto: &str, npcs_presentes: &
 /// Aplica uma proposta ao Player em memória (o chamador é responsável por
 /// persistir depois). Retorna o evento `mudanca_estado` se aplicada, ou uma
 /// razão de rejeição em texto.
-pub fn aplicar(player: &mut Player, turno: u64, proposta: &MudancaProposta) -> Result<Event, String> {
+pub fn aplicar(
+    player: &mut Player,
+    turno: u64,
+    proposta: &MudancaProposta,
+) -> Result<Event, String> {
     match (proposta.campo.as_str(), proposta.operacao.as_str()) {
         ("player.hp", "somar") => {
             let delta = proposta
@@ -152,7 +177,9 @@ pub fn aplicar(player: &mut Player, turno: u64, proposta: &MudancaProposta) -> R
             let novo = (player.hp.atual as i64 + delta).clamp(0, player.hp.maximo as i64);
             let anterior = player.hp.atual;
             if novo as i32 == anterior {
-                return Err("player.hp: proposta nao muda o valor atual (no-op), descartando".to_string());
+                return Err(
+                    "player.hp: proposta nao muda o valor atual (no-op), descartando".to_string(),
+                );
             }
             player.hp.atual = novo as i32;
             Ok(Event::new(
@@ -170,7 +197,10 @@ pub fn aplicar(player: &mut Player, turno: u64, proposta: &MudancaProposta) -> R
             let novo = (player.moedas as i64 + delta).max(0);
             let anterior = player.moedas;
             if novo as u32 == anterior {
-                return Err("player.moedas: proposta nao muda o valor atual (no-op), descartando".to_string());
+                return Err(
+                    "player.moedas: proposta nao muda o valor atual (no-op), descartando"
+                        .to_string(),
+                );
             }
             player.moedas = novo as u32;
             Ok(Event::new(
@@ -217,7 +247,9 @@ pub fn aplicar(player: &mut Player, turno: u64, proposta: &MudancaProposta) -> R
                 .inventario
                 .iter()
                 .position(|i| i.nome == item)
-                .ok_or_else(|| format!("item '{item}' nao esta no inventario, rejeitando remocao"))?;
+                .ok_or_else(|| {
+                    format!("item '{item}' nao esta no inventario, rejeitando remocao")
+                })?;
             player.inventario[pos].quantidade -= 1;
             let quantidade = player.inventario[pos].quantidade;
             if quantidade == 0 {
@@ -248,7 +280,9 @@ pub fn aplicar(player: &mut Player, turno: u64, proposta: &MudancaProposta) -> R
                 serde_json::json!({ "campo": "player.location_id", "operacao": "definir", "valor": destino, "anterior": anterior }),
             ))
         }
-        (campo, operacao) => Err(format!("campo/operacao fora da whitelist: {campo} / {operacao}")),
+        (campo, operacao) => Err(format!(
+            "campo/operacao fora da whitelist: {campo} / {operacao}"
+        )),
     }
 }
 
@@ -260,9 +294,16 @@ mod tests {
     fn jogador() -> Player {
         Player {
             id: "player_01".into(),
-            hp: Hp { atual: 10, maximo: 20 },
+            hp: Hp {
+                atual: 10,
+                maximo: 20,
+            },
             atributos: Default::default(),
-            inventario: vec![ItemInventario { nome: "chave_enferrujada".into(), quantidade: 1, categoria: String::new() }],
+            inventario: vec![ItemInventario {
+                nome: "chave_enferrujada".into(),
+                quantidade: 1,
+                categoria: String::new(),
+            }],
             location_id: "taverna".into(),
             nivel: 1,
             classe: "guerreiro".into(),
@@ -276,7 +317,12 @@ mod tests {
     fn rejeita_hp_no_op_quando_ja_esta_no_maximo() {
         let mut p = jogador();
         p.hp.atual = p.hp.maximo;
-        let proposta = MudancaProposta { campo: "player.hp".into(), operacao: "somar".into(), valor: serde_json::json!(5), categoria: None };
+        let proposta = MudancaProposta {
+            campo: "player.hp".into(),
+            operacao: "somar".into(),
+            valor: serde_json::json!(5),
+            categoria: None,
+        };
         assert!(aplicar(&mut p, 0, &proposta).is_err());
         assert_eq!(p.hp.atual, p.hp.maximo);
     }
@@ -284,11 +330,21 @@ mod tests {
     #[test]
     fn aplica_gasto_de_moedas_e_nao_deixa_negativo() {
         let mut p = jogador();
-        let proposta = MudancaProposta { campo: "player.moedas".into(), operacao: "somar".into(), valor: serde_json::json!(-5), categoria: None };
+        let proposta = MudancaProposta {
+            campo: "player.moedas".into(),
+            operacao: "somar".into(),
+            valor: serde_json::json!(-5),
+            categoria: None,
+        };
         aplicar(&mut p, 0, &proposta).unwrap();
         assert_eq!(p.moedas, 10);
 
-        let proposta_excede = MudancaProposta { campo: "player.moedas".into(), operacao: "somar".into(), valor: serde_json::json!(-1000), categoria: None };
+        let proposta_excede = MudancaProposta {
+            campo: "player.moedas".into(),
+            operacao: "somar".into(),
+            valor: serde_json::json!(-1000),
+            categoria: None,
+        };
         aplicar(&mut p, 0, &proposta_excede).unwrap();
         assert_eq!(p.moedas, 0);
     }
@@ -296,14 +352,24 @@ mod tests {
     #[test]
     fn rejeita_moedas_no_op() {
         let mut p = jogador();
-        let proposta = MudancaProposta { campo: "player.moedas".into(), operacao: "somar".into(), valor: serde_json::json!(0), categoria: None };
+        let proposta = MudancaProposta {
+            campo: "player.moedas".into(),
+            operacao: "somar".into(),
+            valor: serde_json::json!(0),
+            categoria: None,
+        };
         assert!(aplicar(&mut p, 0, &proposta).is_err());
     }
 
     #[test]
     fn evento_de_inventario_carrega_quantidade() {
         let mut p = jogador();
-        let proposta = MudancaProposta { campo: "player.inventario".into(), operacao: "adicionar".into(), valor: serde_json::json!("cerveja"), categoria: Some("consumivel".into()) };
+        let proposta = MudancaProposta {
+            campo: "player.inventario".into(),
+            operacao: "adicionar".into(),
+            valor: serde_json::json!("cerveja"),
+            categoria: Some("consumivel".into()),
+        };
         let evento = aplicar(&mut p, 0, &proposta).unwrap();
         assert_eq!(evento.payload["quantidade"], 1);
 
@@ -332,6 +398,7 @@ mod tests {
             moedas: Some(50),
             precos: [(item.to_string(), preco)].into_iter().collect(),
             interesses: vec![],
+            temperamento_base: Default::default(),
         }
     }
 
@@ -344,7 +411,12 @@ mod tests {
     #[test]
     fn aplica_dano_e_clampa_no_minimo_zero() {
         let mut p = jogador();
-        let proposta = MudancaProposta { campo: "player.hp".into(), operacao: "somar".into(), valor: serde_json::json!(-100), categoria: None };
+        let proposta = MudancaProposta {
+            campo: "player.hp".into(),
+            operacao: "somar".into(),
+            valor: serde_json::json!(-100),
+            categoria: None,
+        };
         aplicar(&mut p, 0, &proposta).unwrap();
         assert_eq!(p.hp.atual, 0);
     }
@@ -352,7 +424,12 @@ mod tests {
     #[test]
     fn aplica_cura_e_clampa_no_maximo() {
         let mut p = jogador();
-        let proposta = MudancaProposta { campo: "player.hp".into(), operacao: "somar".into(), valor: serde_json::json!(100), categoria: None };
+        let proposta = MudancaProposta {
+            campo: "player.hp".into(),
+            operacao: "somar".into(),
+            valor: serde_json::json!(100),
+            categoria: None,
+        };
         aplicar(&mut p, 0, &proposta).unwrap();
         assert_eq!(p.hp.atual, 20);
     }
@@ -360,7 +437,12 @@ mod tests {
     #[test]
     fn rejeita_remover_item_inexistente() {
         let mut p = jogador();
-        let proposta = MudancaProposta { campo: "player.inventario".into(), operacao: "remover".into(), valor: serde_json::json!("espada_lendaria"), categoria: None };
+        let proposta = MudancaProposta {
+            campo: "player.inventario".into(),
+            operacao: "remover".into(),
+            valor: serde_json::json!("espada_lendaria"),
+            categoria: None,
+        };
         assert!(aplicar(&mut p, 0, &proposta).is_err());
         assert_eq!(p.inventario.len(), 1);
     }
@@ -368,7 +450,12 @@ mod tests {
     #[test]
     fn rejeita_campo_fora_da_whitelist() {
         let mut p = jogador();
-        let proposta = MudancaProposta { campo: "player.nivel".into(), operacao: "somar".into(), valor: serde_json::json!(1), categoria: None };
+        let proposta = MudancaProposta {
+            campo: "player.nivel".into(),
+            operacao: "somar".into(),
+            valor: serde_json::json!(1),
+            categoria: None,
+        };
         assert!(aplicar(&mut p, 0, &proposta).is_err());
     }
 
@@ -399,7 +486,14 @@ mod tests {
             categoria: None,
         };
         assert!(aplicar(&mut p, 0, &proposta_add).is_ok());
-        assert_eq!(p.inventario.iter().find(|i| i.nome == "chave_enferrujada").unwrap().quantidade, 2);
+        assert_eq!(
+            p.inventario
+                .iter()
+                .find(|i| i.nome == "chave_enferrujada")
+                .unwrap()
+                .quantidade,
+            2
+        );
 
         let proposta_remover = MudancaProposta {
             campo: "player.inventario".into(),
@@ -408,16 +502,32 @@ mod tests {
             categoria: None,
         };
         assert!(aplicar(&mut p, 0, &proposta_remover).is_ok());
-        assert_eq!(p.inventario.iter().find(|i| i.nome == "chave_enferrujada").unwrap().quantidade, 1);
+        assert_eq!(
+            p.inventario
+                .iter()
+                .find(|i| i.nome == "chave_enferrujada")
+                .unwrap()
+                .quantidade,
+            1
+        );
 
         assert!(aplicar(&mut p, 0, &proposta_remover).is_ok());
-        assert!(p.inventario.iter().find(|i| i.nome == "chave_enferrujada").is_none());
+        assert!(p
+            .inventario
+            .iter()
+            .find(|i| i.nome == "chave_enferrujada")
+            .is_none());
     }
 
     #[test]
     fn move_jogador_para_novo_local() {
         let mut p = jogador();
-        let proposta = MudancaProposta { campo: "player.location_id".into(), operacao: "definir".into(), valor: serde_json::json!("floresta_negra"), categoria: None };
+        let proposta = MudancaProposta {
+            campo: "player.location_id".into(),
+            operacao: "definir".into(),
+            valor: serde_json::json!("floresta_negra"),
+            categoria: None,
+        };
         assert!(aplicar(&mut p, 0, &proposta).is_ok());
         assert_eq!(p.location_id, "floresta_negra");
     }
@@ -425,7 +535,12 @@ mod tests {
     #[test]
     fn rejeita_destino_vazio() {
         let mut p = jogador();
-        let proposta = MudancaProposta { campo: "player.location_id".into(), operacao: "definir".into(), valor: serde_json::json!(""), categoria: None };
+        let proposta = MudancaProposta {
+            campo: "player.location_id".into(),
+            operacao: "definir".into(),
+            valor: serde_json::json!(""),
+            categoria: None,
+        };
         assert!(aplicar(&mut p, 0, &proposta).is_err());
     }
 }

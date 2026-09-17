@@ -290,6 +290,7 @@ mod tests {
             precos: Default::default(),
             interesses: vec![],
             resistencias: vec![],
+            temperamento_base: Default::default(),
         }
     }
 
